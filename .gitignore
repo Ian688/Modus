@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Electron
+electron/node_modules/
+electron/.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local config
+.claude/
+
+# Design drafts
+UI_DESIGN*.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+
+# Modus data
+*.modus/
+.modus/
+session_store.db
+
+# Stray dev artifacts / one-off scripts
+fps-training/
+check_js*.py
+fibonacci.py
+e2e_*.txt
+*.tmp
+
+# Session/agent working directories
+.remember/
+.hermes/

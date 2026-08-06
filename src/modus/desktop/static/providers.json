@@ -1,0 +1,10 @@
+{
+  "deepseek": ["", ["deepseek-v4-flash", "deepseek-v4"]],
+  "openai": ["https://api.openai.com/v1", ["gpt-4o", "gpt-4o-mini", "o3-mini", "gpt-4.1"]],
+  "anthropic": ["https://api.anthropic.com/v1", ["claude-sonnet-4", "claude-haiku-4", "claude-opus-4"]],
+  "google": ["https://generativelanguage.googleapis.com/v1beta", ["gemini-2.0-flash", "gemini-2.0-pro"]],
+  "groq": ["https://api.groq.com/openai/v1", ["llama-3.3-70b", "mixtral-8x7b"]],
+  "xai": ["https://api.x.ai/v1", ["grok-2", "grok-beta"]],
+  "ollama": ["http://127.0.0.1:11434/v1", ["llama3", "qwen2.5", "mistral"]],
+  "custom": [null, []]
+}

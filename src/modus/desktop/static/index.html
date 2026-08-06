@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modus — AI Agent</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%231a1a1a'/><text x='50' y='68' font-size='50' font-weight='700' fill='white' text-anchor='middle' font-family='system-ui'>M</text></svg>">
+<link rel="stylesheet" href="/static/workbench.css?v=27">
+</head>
+<body>
+
+<div class="app">
+  <button class="mobile-sidebar-scrim" id="mobileSidebarScrim" type="button" aria-label="关闭会话列表"></button>
+  <button class="workbench-scrim" id="workbenchScrim" type="button" aria-label="关闭任务面板"></button>
+  <!-- ─── Sidebar ─── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-primary-row">
+      <button class="sb-new-chat" id="newChatBtn" title="新建一个空白会话"><span aria-hidden="true">＋</span><span>新建会话</span></button>
+      <div class="sb-search" tabindex="0" aria-label="展开会话搜索"><input id="sbSearch" type="text" role="searchbox" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="搜索会话..." aria-label="搜索会话"><button class="sb-search-clear" id="sbSearchClear" type="button" title="清除搜索" aria-label="清除搜索" hidden>×</button></div>
+    </div>
+    <div class="sb-list" id="sbList"><div class="sb-empty" style="text-align:center;padding:12px;color:var(--text-tertiary);font-size:10px;">加载中...</div></div>
+    <div class="sb-utility" aria-label="应用功能">
+      <button class="sb-utility-btn" id="settingsBtn" aria-label="打开设置" title="设置">•••</button>
+    </div>
+  </aside>
+
+  <!-- ─── Main ─── -->
+  <main class="main-col">
+    <div class="mobile-topbar">
+      <button class="mobile-icon-btn" id="mobileSessionsBtn" type="button" aria-label="打开会话列表" aria-expanded="false" aria-controls="sidebar">☰</button>
+      <div class="mobile-brand">Modus</div>
+      <button class="mobile-icon-btn" id="mobileSettingsBtn" type="button" aria-label="打开设置">⚙</button>
+    </div>
+    <div class="run-control" id="runControl" hidden>
+      <button class="tb-btn" id="stopBtn" type="button" style="border-color:var(--red);color:var(--red);">停止当前任务</button>
+    </div>
+    <div class="activity-bar"><span class="act-icon" id="actIcon">○</span><span class="act-text" id="actText">准备就绪</span><span class="agent-status-chip" id="agentStatusChip" hidden></span><button class="workbench-toggle" id="workbenchToggleBtn" type="button" aria-label="打开任务面板" aria-expanded="false" aria-controls="rightPanel"><span aria-hidden="true">⌘</span> 任务</button></div>
+    <div class="chat-area" id="chatArea">
+      <div class="empty-state" id="chatEmpty">
+        <div class="es-icon">◇</div>
+        <div class="es-title">开始一段新对话</div>
+        <div class="es-desc">描述你想完成的事</div>
+      </div>
+    </div>
+    <div class="in-bar">
+      <div class="skill-bar" id="skillBar" aria-label="常用 Skills"></div>
+      <div class="skill-chip" id="skillChip" hidden><span id="skillChipLabel"></span><button type="button" id="skillChipRemove" aria-label="移除 Skill">×</button></div>
+      <div class="composer-shell">
+        <div class="composer-select-wrap">
+          <button class="composer-select" id="composerSelect" type="button" disabled aria-haspopup="dialog" aria-expanded="false"><span id="composerSelectLabel">选择模型</span><span aria-hidden="true">⌄</span></button>
+          <div class="composer-menu" id="composerMenu" hidden role="dialog" aria-label="选择模型或增强方式"></div>
+        </div>
+        <div class="composer-select-wrap" id="composerReasoningWrap" hidden>
+          <button class="composer-select composer-reasoning" id="composerReasoning" type="button" aria-haspopup="menu" aria-expanded="false"><span id="composerReasoningLabel">思考：默认</span><span aria-hidden="true">⌄</span></button>
+          <div class="composer-menu composer-reasoning-menu" id="composerReasoningMenu" hidden role="menu" aria-label="选择思考深度"></div>
+        </div>
+        <div class="in-w">
+          <textarea id="input" rows="1" placeholder="添加模型后即可开始对话" disabled></textarea>
+          <button class="btn-s" id="sendBtn" disabled aria-label="发送">↑</button>
+          <div class="skill-at-menu" id="skillAtMenu" hidden role="menu" aria-label="选择 Skill"></div>
+        </div>
+      </div>
+    </div>
+    <!-- 协作记录（MOA / Peri） -->
+    <div class="sub-divider" id="chatDivider" style="display:none;">━━━ 协作记录 ━━━</div>
+    <div class="lower-chat-area" id="chatAreaLower" style="display:none;flex:1;overflow-y:auto;padding:6px;flex-direction:column;gap:4px;">
+      <div class="empty-state"><div class="es-icon">◇</div><div class="es-title">协作记录</div><div class="es-desc">参考意见、任务分派与进度会在此按时间呈现</div></div>
+    </div>
+    <div class="onboarding" id="onboarding" hidden>
+      <div class="onboarding-card">
+        <div class="ob-steps" id="obSteps"><div class="ob-step"></div><div class="ob-step"></div><div class="ob-step"></div></div>
+        <div id="obBody"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- ─── Right Panel ─── -->
+  <aside class="right-panel" id="rightPanel" aria-label="Agent 工作台">
+    <div class="workbench-panel-head"><strong>Agent 工作台</strong><button id="wbPinBtn" type="button" aria-label="锁定窗口不自动切换" title="锁定：窗口不随 Agent 自动切换">📌</button><button id="workbenchCloseBtn" type="button" aria-label="关闭任务面板">×</button></div>
+    <!-- KANBAN board: the single right-panel view.  Empty state before first run. -->
+    <div id="kbEmptyState" hidden>
+      <div class="rp-section"><div class="rp-hd">▣ 工作区</div>
+        <div class="wb-workspace-manager" id="rpWorkspace">
+          <div class="wb-workspace-list" id="workspaceMemoryList"><div class="rp-empty">正在读取工作区记录…</div></div>
+          <form class="wb-workspace-path" id="workspacePathForm" hidden>
+            <input id="workspacePathInput" type="text" autocomplete="off" placeholder="文件夹绝对路径">
+            <button type="submit">添加</button>
+          </form>
+          <div class="wb-workspace-status" id="workspaceManagerStatus" aria-live="polite"></div>
+        </div>
+      </div>
+      <div class="kb-empty-hint">Agent 开始运行时，这里会变成流程看板。</div>
+    </div>
+    <div id="kbBoard" hidden>
+      <div class="kb-board-head">
+        <select id="kbRunSelect" aria-label="按运行筛选"></select>
+        <div class="kb-focus"><span>当前聚焦</span><b id="wvBody" data-state="idle">等待任务...</b></div>
+      </div>
+      <div id="kbColumns" class="kb-columns" role="list"></div>
+      <div id="kbDrawer" class="kb-drawer" hidden></div>
+      <div id="kbDocument" hidden></div>
+    </div>
+  </aside>
+</div>
+
+<!-- Artifact Viewer: request/response ownership is wired by the transport layer. -->
+<div class="artifact-viewer-overlay" id="artifactViewerOverlay" hidden>
+  <section class="artifact-viewer" id="artifactViewerDialog" role="dialog" aria-modal="true" aria-labelledby="artifactViewerTitle" aria-describedby="artifactViewerStatus" tabindex="-1">
+    <header class="artifact-viewer-head">
+      <span class="artifact-viewer-mark" aria-hidden="true">▣</span>
+      <div class="artifact-viewer-heading">
+        <span>RUN ARTIFACT</span>
+        <h2 id="artifactViewerTitle">运行产物</h2>
+      </div>
+      <button class="artifact-viewer-close" id="artifactViewerCloseBtn" type="button" aria-label="关闭产物查看器">×</button>
+    </header>
+    <dl class="artifact-viewer-meta" aria-label="产物元数据">
+      <div><dt>类型</dt><dd id="artifactViewerKind">artifact</dd></div>
+      <div><dt>大小</dt><dd id="artifactViewerSize">—</dd></div>
+      <div class="artifact-viewer-meta-id"><dt>ID</dt><dd id="artifactViewerId">—</dd></div>
+    </dl>
+    <p class="artifact-viewer-status" id="artifactViewerStatus" role="status" aria-live="polite">等待读取产物</p>
+    <div class="artifact-viewer-body">
+      <div class="artifact-viewer-loading" id="artifactViewerLoading" role="status">
+        <span class="artifact-viewer-spinner" aria-hidden="true"></span>
+        <div><strong>正在读取产物</strong><span>正在校验并加载本机保存的内容…</span></div>
+      </div>
+      <div class="artifact-viewer-error" id="artifactViewerError" role="alert" hidden>
+        <span aria-hidden="true">!</span>
+        <div><strong>无法读取产物</strong><p id="artifactViewerErrorMessage">请稍后重试。</p></div>
+        <button class="plain-small" id="artifactViewerRetryBtn" type="button">重试</button>
+      </div>
+      <pre class="artifact-viewer-content" id="artifactViewerContent" tabindex="0" aria-label="产物文本内容" hidden></pre>
+    </div>
+    <footer class="artifact-viewer-actions">
+      <span id="artifactViewerActionStatus" role="status" aria-live="polite"></span>
+      <button class="plain-small" id="artifactViewerCopyBtn" type="button" disabled>复制内容</button>
+      <button class="plain-small" id="artifactViewerDownloadBtn" type="button" disabled>下载</button>
+      <button class="primary-small" id="artifactViewerDoneBtn" type="button">关闭</button>
+    </footer>
+  </section>
+</div>
+
+<!-- Custom Confirm Modal -->
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal" style="width:320px;text-align:center;">
+    <div style="padding:16px;">
+      <div style="font-size:18px;margin-bottom:8px;" id="confirmIcon">⚠</div>
+      <div style="font-size:13px;font-weight:500;margin-bottom:4px;" id="confirmTitle">确认删除</div>
+      <div style="font-size:11px;color:var(--text-secondary);margin-bottom:12px;" id="confirmMsg">确定要删除此会话吗？</div>
+      <div style="display:flex;gap:8px;justify-content:center;">
+        <button id="confirmCancelBtn" style="padding:5px 16px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text-secondary);font-size:11px;cursor:pointer;">取消</button>
+        <button id="confirmOkBtn" style="padding:5px 16px;border:none;border-radius:6px;background:var(--red);color:white;font-size:11px;cursor:pointer;font-weight:500;">确认</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Auth Delete Confirmation (cascade option) -->
+<div class="modal-overlay" id="authDeleteModal">
+  <div class="modal" style="width:320px;">
+    <div style="padding:16px;">
+      <div style="font-size:14px;font-weight:600;margin-bottom:8px;" id="authDeleteTitle">删除账户</div>
+      <div style="font-size:11px;color:var(--text-secondary);margin-bottom:12px;" id="authDeleteMsg">确定要删除此账户吗？</div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--text-secondary);margin-bottom:14px;cursor:pointer;">
+        <input type="checkbox" id="authDeleteCascade"> 同时删除该账户的会话 / 记忆 / 运行数据
+      </label>
+      <div style="display:flex;gap:8px;justify-content:flex-end;">
+        <button id="authDeleteCancelBtn" style="padding:5px 14px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text-secondary);font-size:11px;cursor:pointer;">取消</button>
+        <button id="authDeleteOkBtn" style="padding:5px 14px;border:none;border-radius:6px;background:var(--red);color:white;font-size:11px;cursor:pointer;font-weight:500;">确认删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Page (standalone view; replaces the old floating modal) -->
+<div class="settings-view" id="settingsModal" role="dialog" aria-modal="true" aria-label="设置">
+  <div class="settings-layout">
+    <nav class="settings-nav" aria-label="设置分类">
+      <button id="closeModal" class="settings-back" type="button" aria-label="返回工作区" title="返回工作区">← 返回</button>
+      <button class="settings-tab active" data-tab="repo"><span>📦</span>模型仓库</button>
+      <button class="settings-tab" data-tab="mode"><span>◈</span>模式</button>
+      <button class="settings-tab" data-tab="memory"><span>🧠</span>记忆</button>
+      <button class="settings-tab" data-tab="appearance"><span>◐</span>外观</button>
+      <button class="settings-tab" data-tab="account"><span>👤</span>账户</button>
+      <button class="settings-tab" data-tab="skills"><span>⚡</span>Skills</button>
+      <button class="settings-tab" data-tab="extensions"><span>🔌</span>扩展</button>
+      <button class="settings-tab" data-tab="about"><span>ℹ</span>关于</button>
+    </nav>
+    <main class="settings-content">
+      <div id="modalStatus" style="text-align:center;font-size:10px;padding:3px;margin-bottom:4px;border-radius:4px;display:none;"></div>
+      <!-- 模型仓库 -->
+      <div class="settings-panel" id="panel-repo">
+        <div class="settings-section-head"><div><div class="settings-title">模型仓库</div><div class="settings-copy" id="repoSummary">正在读取模型仓库…</div></div><button class="primary-small" id="repoAddBtn" type="button">添加模型</button></div>
+        <div id="repoDiscovery" class="repo-editor" hidden><div class="settings-copy" id="repoDiscoveryStatus"></div><div class="repo-form-grid"><label>厂商返回的模型<select id="repoDiscoveredModel"></select></label><span class="settings-copy">模型可用性来自厂商 API；上下文、工具与思考深度仍需在添加前确认。</span></div><div class="repo-editor-actions"><button id="repoUseDiscoveredBtn" class="primary-small" type="button">填写并添加</button><button id="repoDiscoveryCloseBtn" class="plain-small" type="button">关闭</button></div></div>
+        <div id="repoEditor" class="repo-editor" hidden>
+          <div class="repo-form-grid"><label>名称<input id="repoName" placeholder="例如：DeepSeek 主力"></label><label>提供商<select id="repoProvider"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="google">Google</option><option value="groq">Groq</option><option value="xai">xAI</option><option value="ollama">Ollama</option><option value="custom">自定义</option></select></label></div>
+          <div class="repo-form-grid"><label>模型 ID<input id="repoModel" placeholder="例如：deepseek-v4"></label><label>Endpoint（可选）<input id="repoEndpoint" placeholder="https://…"></label></div>
+          <div class="repo-form-grid"><label>上下文窗口（tokens）<input id="repoContextWindow" type="number" min="1024" max="10000000" step="1024" value="128000"></label><label>最大输出（tokens）<input id="repoMaxOutput" type="number" min="1" max="1000000" step="256" value="8192"></label></div>
+          <div class="repo-form-grid"><label>思考深度（逗号分隔）<input id="repoReasoningEfforts" placeholder="例如：low,medium,high"></label><label>默认思考深度<input id="repoDefaultReasoning" placeholder="例如：medium"></label></div>
+          <div class="repo-form-grid"><label><input id="repoSupportsTools" type="checkbox" checked> 支持工具调用</label><label><input id="repoSupportsImages" type="checkbox"> 支持图片输入</label></div>
+          <label>API Key<input id="repoKey" type="password" placeholder="仅在新增或替换凭据时填写"></label>
+          <div class="repo-editor-actions"><button id="repoTestBtn" class="plain-small" type="button">测试连接</button><button id="repoSaveBtn" class="primary-small" type="button">保存</button><button id="repoCancelBtn" class="plain-small" type="button">取消</button></div>
+          <div id="repoTestStatus" class="settings-copy" style="margin-top:6px;display:none;"></div>
+        </div>
+        <div id="repoModelList" class="repo-groups"></div>
+        <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+          <div class="settings-title" style="font-size:12px;margin-bottom:6px;">凭据存储</div>
+          <div class="settings-copy" style="margin-bottom:8px;">模型 API Key 保存在本机；macOS 上可迁移到系统钥匙串。迁移前会显示脱敏报告，确认后才会执行。</div>
+          <button id="credMigrationBtn" class="plain-small" type="button">生成迁移报告…</button>
+          <div id="credMigrationReport" class="settings-copy" style="margin-top:8px;padding:6px;background:var(--bg-elevated);border-radius:5px;display:none;white-space:pre-wrap;"></div>
+        </div>
+      </div>
+      <!-- 模式（会话 / MOA / Peri 共用管理界面） -->
+      <div class="settings-panel" id="panel-mode" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">模式</div><div class="settings-copy">选择 Agent 的协作形态。默认由当前 LLM 直接执行；需要更多协作时启用高级形态。</div></div></div>
+        <div class="mode-subtabs" role="tablist" aria-label="模式分类">
+          <button type="button" class="mode-subtab active" data-tab="session" role="tab" aria-selected="true">🗂 会话</button>
+          <button type="button" class="mode-subtab" data-tab="moa" role="tab" aria-selected="false">◫ MOA</button>
+          <button type="button" class="mode-subtab" data-tab="peri" role="tab" aria-selected="false">◈ Peri</button>
+        </div>
+        <div class="settings-panel mode-panel" id="panel-session" data-mode-panel="session">
+          <div class="settings-section-head"><div><div class="settings-title">当前会话</div><div class="settings-copy">仅影响当前会话。Modus 的内置工具规则和安全约束仍会保留。</div></div></div>
+          <label>会话系统提示词<textarea id="sessionSystemPrompt" rows="9" placeholder="例如：你是一个谨慎的代码审查助手，先说明假设，再给出可验证的修改方案。"></textarea></label>
+          <div class="settings-copy" style="margin-top:6px;">提示词会在下一次运行中生效，不会修改其他会话。</div>
+          <div id="sessionRunStatus" class="settings-copy" style="margin-top:8px;padding:6px;background:var(--bg-elevated);border-radius:5px;">尚未读取最近运行状态。</div>
+          <div class="repo-editor-actions"><button id="sessionPromptSaveBtn" class="primary-small" type="button">保存会话提示词</button><button id="sessionPromptResetBtn" class="plain-small" type="button">清空</button></div>
+        </div>
+      <div class="settings-panel mode-panel" id="panel-moa" data-mode-panel="moa" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">MOA — 多模型参考</div><div class="settings-copy">主持人收集独立参考模型的意见，保留共识与分歧后给出综合结论。参考模型不会执行工具。</div></div></div>
+        <div class="mode-config">
+          <div class="mode-config-row role-card" data-role="host"><span class="role-badge">👑</span><div class="role-head"><strong>Host LLM</strong><small>负责聚合、工具执行与最终答复</small></div><label>Temperature<input type="number" id="moaHostTemp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.4"></label><label>上下文 tokens<input type="number" id="moaHostContext" min="1024" step="1024"></label><label>思考深度<select id="moaHostReasoning"></select></label><div class="role-model"><label>模型<select id="moaHostModel" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <div class="mode-config-row role-card" data-role="ref"><span class="role-badge">🔍</span><div class="role-head"><strong>参考 LLM 1</strong><small>独立视角，不执行工具</small></div><label>Temperature<input type="number" id="moaRef1Temp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.7"></label><label>上下文 tokens<input type="number" id="moaRef1Context" min="1024" step="1024"></label><label>思考深度<select id="moaRef1Reasoning"></select></label><div class="role-model"><label>模型<select id="moaRef1" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <div class="mode-config-row role-card" data-role="ref"><span class="role-badge">🔍</span><div class="role-head"><strong>参考 LLM 2</strong><small>独立视角，不执行工具</small></div><label>Temperature<input type="number" id="moaRef2Temp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.7"></label><label>上下文 tokens<input type="number" id="moaRef2Context" min="1024" step="1024"></label><label>思考深度<select id="moaRef2Reasoning"></select></label><div class="role-model"><label>模型<select id="moaRef2" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <button id="moaSaveBtn" class="primary-small" type="button" style="margin-top:10px;">保存 MOA 配置</button>
+        </div>
+      </div>
+      <div class="settings-panel mode-panel" id="panel-peri" data-mode-panel="peri" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">Peri — 共识导向协作</div><div class="settings-copy">受 Perichoresis 启发：Host 与多个 Worker 分工执行、相互审阅、必要时修订，最终由 Host 形成一致结论。</div></div></div>
+        <div class="mode-config">
+          <div class="mode-config-row role-card" data-role="host"><span class="role-badge">👑</span><div class="role-head"><strong>Host Agent</strong><small>负责拆分、审阅与合并</small></div><label>Temperature<input type="number" id="periHostTemp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.4"></label><label>上下文 tokens<input type="number" id="periHostContext" min="1024" step="1024"></label><label>思考深度<select id="periHostReasoning"></select></label><div class="role-model"><label>模型<select id="periHostModel" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <div class="mode-config-row role-card" data-role="worker"><span class="role-badge">⚙</span><div class="role-head"><strong>Worker Agent 1</strong><small>分工执行，产出与修订</small></div><label>Temperature<input type="number" id="periSub1Temp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.7"></label><label>上下文 tokens<input type="number" id="periSub1Context" min="1024" step="1024"></label><label>思考深度<select id="periSub1Reasoning"></select></label><div class="role-model"><label>模型<select id="periSub1" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <div class="mode-config-row role-card" data-role="worker"><span class="role-badge">⚙</span><div class="role-head"><strong>Worker Agent 2</strong><small>分工执行，产出与修订</small></div><label>Temperature<input type="number" id="periSub2Temp" class="mode-temp-input" min="0" max="2" step="0.1" value="0.7"></label><label>上下文 tokens<input type="number" id="periSub2Context" min="1024" step="1024"></label><label>思考深度<select id="periSub2Reasoning"></select></label><div class="role-model"><label>模型<select id="periSub2" class="mode-model-select"><option value="">— 选择 —</option></select></label></div></div>
+          <button id="periSaveBtn" class="primary-small" type="button" style="margin-top:10px;">保存 Peri 配置</button>
+          <button id="periReadinessBtn" class="plain-small" type="button" style="margin-top:10px;">检查 Git 隔离就绪度</button>
+          <div id="periReadiness" class="settings-copy" style="margin-top:8px;"></div>
+        </div>
+      </div>
+    </div>
+      <div class="settings-panel" id="panel-memory" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">会话记忆</div><div class="settings-copy">只作为背景参考注入当前会话，不会自动变成新的用户指令。</div></div><button id="memoryClearBtn" class="plain-small" type="button">清空全部</button></div>
+        <div class="repo-editor" style="display:block;margin-bottom:8px;">
+          <label>引用已有会话 <input id="sessionReferenceId" placeholder="粘贴其他会话的 ID"></label>
+          <div class="settings-copy" style="margin-top:5px;">引用会先脱敏并保存为仅供参考的材料；其中的历史指令不会成为当前指令，也不会触发工具。</div>
+          <div class="repo-editor-actions"><button id="sessionReferenceAddBtn" class="plain-small" type="button">添加会话参考</button></div>
+        </div>
+        <div class="repo-editor" style="display:block;margin-bottom:8px;">
+          <label>记忆内容<textarea id="memoryFact" rows="3" placeholder="例如：项目使用 Python 3.12，测试命令是 pytest -q"></textarea></label>
+          <div class="repo-form-grid"><label>分类<select id="memoryCategory"><option value="general">一般</option><option value="constraint">约束</option><option value="preference">偏好</option><option value="fact">事实</option></select></label><div class="repo-editor-actions" style="align-items:end;"><button id="memoryAddBtn" class="primary-small" type="button">添加记忆</button></div></div>
+        </div>
+        <div class="repo-editor" style="display:block;margin-bottom:8px;">
+          <div class="settings-title" style="font-size:12px;margin-bottom:6px;">记忆检索配置</div>
+          <div class="settings-copy" style="margin-bottom:8px;">控制 Agent 在运行中如何利用长期记忆。自动记忆需要模型支持向量检索；关闭检索后仍保留关键词召回。</div>
+          <div class="repo-form-grid">
+            <label><input id="memAutoMemorize" type="checkbox"> 运行后自动沉淀记忆</label>
+            <label><input id="memRetrieval" type="checkbox"> 启用向量检索</label>
+          </div>
+          <div class="repo-form-grid"><label>单次检索结果上限<input id="memRetrievalLimit" type="number" min="1" max="50" step="1" value="8"></label><div class="repo-editor-actions" style="align-items:end;"><button id="memoryConfigSaveBtn" class="primary-small" type="button">保存记忆配置</button></div></div>
+          <div id="memoryConfigStatus" class="settings-copy" style="margin-top:6px;display:none;"></div>
+        </div>
+        <div id="memoryList" class="repo-groups"><div class="repo-empty">当前会话还没有记忆。</div></div>
+      </div>
+      <!-- 外观 -->
+      <div class="settings-panel" id="panel-appearance" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">外观</div><div class="settings-copy">选择 Modus 的界面材质。设置会保存在本机并立即生效。</div></div></div>
+        <div class="appearance-options" role="radiogroup" aria-label="页面主题">
+          <button type="button" class="appearance-option" data-theme-choice="glass" role="radio" aria-checked="false"><span class="appearance-swatch glass" aria-hidden="true"></span><strong>玻璃</strong><small>明亮、柔和的半透明界面</small></button>
+          <button type="button" class="appearance-option" data-theme-choice="linear" role="radio" aria-checked="false"><span class="appearance-swatch linear" aria-hidden="true"></span><strong>线性</strong><small>克制、清晰的浅色界面</small></button>
+          <button type="button" class="appearance-option" data-theme-choice="deep" role="radio" aria-checked="false"><span class="appearance-swatch deep" aria-hidden="true"></span><strong>深邃</strong><small>低亮度的深色界面</small></button>
+        </div>
+      </div>
+      <!-- 账户中心 -->
+      <div class="settings-panel" id="panel-account" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">账户</div><div class="settings-copy" id="accountSubtitle">加载账户信息…</div></div></div>
+        <div class="account-overview" id="accountOverview">
+          <div class="account-balance-card"><span class="account-card-label">余额</span><strong id="accountBalance">—</strong><small id="accountLifetime">累计用量 —</small></div>
+          <div class="account-balance-card accent"><span class="account-card-label">累计充值</span><strong id="accountRecharge">—</strong><small>本地额度包</small></div>
+        </div>
+        <div class="account-section">
+          <div class="settings-title">充值</div>
+          <div class="account-recharge-row">
+            <input id="rechargeAmount" type="number" min="1" step="1" placeholder="金额（元）" aria-label="充值金额">
+            <button id="rechargeBtn" class="primary-small" type="button">充值</button>
+            <span class="settings-copy">1 元 = 100 分；本地模拟计费，无真实支付。</span>
+          </div>
+        </div>
+        <div class="account-section">
+          <div class="settings-title">近 14 天用量</div>
+          <div class="account-chart" id="usageChart"><div class="repo-empty">暂无用量数据</div></div>
+        </div>
+        <div class="account-section">
+          <div class="settings-section-head" style="margin-bottom:10px;"><div><div class="settings-title">API 余量</div><div class="settings-copy">查询各模型提供商的官方余额 / 用量 / 成本。DeepSeek 有官方余额接口；OpenAI / Anthropic 需 Organization Admin Key 查看组织用量。</div></div><button id="providerUsageRefreshBtn" class="plain-small" type="button">刷新查询</button></div>
+          <div id="providerUsageList" class="repo-groups"><div class="repo-empty">点击"刷新查询"拉取各模型余量</div></div>
+        </div>
+        <div class="account-section">
+          <div class="settings-title">按模型用量</div>
+          <div id="modelUsage" class="repo-groups"><div class="repo-empty">暂无模型用量</div></div>
+        </div>
+        <div class="account-section">
+          <div class="settings-title">用户与口令锁</div>
+          <div id="accountUsers" class="repo-groups"></div>
+          <div class="repo-editor" style="display:block;margin-top:10px;">
+            <label>当前用户口令锁 <input id="accountPassword" type="password" placeholder="设置/清除口令（留空清除）"></label>
+            <div class="repo-editor-actions"><button id="accountSetPasswordBtn" class="primary-small" type="button">保存口令</button></div>
+            <div class="settings-copy" style="margin-top:6px;">启用后，切换/使用该账号需要输入口令。</div>
+          </div>
+        </div>
+      </div>
+      <div class="settings-panel" id="panel-skills" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">Skills</div><div class="settings-copy">可复用提示模板。选中后会填入输入框；Agent 也能通过 <code>load_skill</code> 读取。</div></div><button id="skillAddBtn" class="primary-small" type="button">添加 Skill</button></div>
+        <div id="skillEditor" class="repo-editor" hidden>
+          <label>名称（小写、数字、-、_）<input id="skillName" placeholder="例如：review-code"></label>
+          <label>说明<input id="skillDescription" placeholder="例如：代码审查模板"></label>
+          <label>提示词<textarea id="skillPrompt" rows="5" placeholder="写入可复用的提示词…"></textarea></label>
+          <div class="repo-editor-actions"><button id="skillSaveBtn" class="primary-small" type="button">保存</button><button id="skillCancelBtn" class="plain-small" type="button">取消</button></div>
+        </div>
+        <div class="skills-import-bar">
+          <div class="skills-import-row">
+            <span class="skills-import-label">从文件导入</span>
+            <div class="skills-import-input"><input type="file" id="skillFileInput" accept=".md,.txt,.py,.js,.sh" style="font-size:10px;"></div>
+          </div>
+          <div class="skills-import-row">
+            <span class="skills-import-label">从网址导入</span>
+            <div class="skills-import-input"><input id="skillUrlInput" placeholder="https://raw.githubusercontent.com/…/prompt.md" style="flex:1;"><button id="skillFetchBtn" class="plain-small" type="button" style="flex-shrink:0;">获取</button></div>
+          </div>
+          <div class="skills-import-row">
+            <span class="skills-import-label">快速模板</span>
+            <div class="skills-import-input"><select id="skillTemplateSelect"><option value="">— 选择模板 —</option><option value="review-code">代码审查</option><option value="arch-design">架构设计</option><option value="test-cover">测试覆盖</option><option value="doc-gen">文档生成</option></select><button id="skillTemplateBtn" class="plain-small" type="button" style="flex-shrink:0;">创建</button></div>
+          </div>
+        </div>
+        <div id="skillList" class="repo-groups"></div>
+      </div>
+      <div class="settings-panel" id="panel-extensions" style="display:none;">
+        <div class="settings-section-head"><div><div class="settings-title">扩展 <span style="font-size:10px;font-weight:400;color:var(--text-tertiary);">MCP · 插件</span></div><div class="settings-copy">MCP (Model Context Protocol) 服务器提供外部工具。</div></div><button id="mcpAddBtn" class="primary-small" type="button">添加 MCP</button></div>
+        <div id="mcpEditor" class="repo-editor" hidden>
+          <div class="repo-form-grid">
+            <label>名称<input id="mcpName" placeholder="例如: brave-search"></label>
+            <label>传输方式<select id="mcpTransport"><option value="stdio">stdio (子进程)</option><option value="sse">SSE (HTTP)</option></select></label>
+          </div>
+          <div id="mcpStdioFields">
+            <div class="repo-form-grid">
+              <label>命令<input id="mcpCommand" placeholder="例如: npx @anthropic/mcp-server"></label>
+              <label>参数<input id="mcpArgs" placeholder="例如: --stdio --verbose"></label>
+            </div>
+            <label>环境变量引用<textarea id="mcpEnv" rows="2" placeholder="SEARCH_API_KEY=env:BRAVE_API_KEY（每行一个）"></textarea></label>
+            <div class="settings-copy" style="margin-top:4px;">MCP 子进程不会继承 Modus 的全部凭据；只注入这里显式声明的进程环境变量引用。</div>
+          </div>
+          <div id="mcpSseFields" style="display:none;">
+            <label>Endpoint URL<input id="mcpUrl" placeholder="https://example.com/mcp"></label>
+          </div>
+          <div class="repo-editor-actions"><button id="mcpSaveBtn" class="primary-small" type="button">保存</button><button id="mcpCancelBtn" class="plain-small" type="button">取消</button></div>
+        </div>
+        <div id="mcpServerList" class="repo-groups"></div>
+        <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:10px;">
+          <div class="settings-title" style="font-size:12px;margin-bottom:6px;">已接入能力</div>
+          <div id="extensionList" class="repo-groups"></div>
+        </div>
+      </div>
+
+      <!-- About -->
+      <div class="settings-panel" id="panel-about" style="display:none;">
+        <div style="font-size:12px;font-weight:600;margin-bottom:6px;">ℹ 关于</div>
+        <div style="font-size:11px;color:var(--text-secondary);line-height:1.6;">
+          <p><strong>Modus Desktop</strong> v0.1.0</p>
+          <p>默认由当前 LLM 直接执行；需要更多协作时启用高级形态。</p>
+          <p style="margin-top:4px;font-size:10px;color:var(--text-tertiary);">MOA · Peri</p>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/protocol.js"></script>
+<script src="/static/workbench.js"></script>
+<script src="/static/core.js?v=7"></script>
+<script src="/static/markdown.js?v=8"></script>
+<script src="/static/userCard.js?v=1"></script>
+<script src="/static/timeline.js?v=15"></script>
+<script src="/static/workspace.js?v=4"></script>
+<script src="/static/websocket.js?v=14"></script>
+<script src="/static/theme.js?v=3"></script>
+<script src="/static/settings.js?v=7"></script>
+<script src="/static/contextbar.js?v=14"></script>
+<script src="/static/agentstatus.js?v=4"></script>
+<script src="/static/workbenchwindows.js?v=6"></script>
+<script src="/static/windowrouter.js?v=4"></script>
+<script src="/static/moduswindows.js?v=4"></script>
+<script src="/static/kanban.js?v=1"></script>
+<script src="/static/cloud_accounts.js?v=2"></script>
+<script src="/static/auth.js?v=6"></script>
+<script src="/static/account.js?v=6"></script>
+<script src="/static/bindings.js?v=5"></script>
+<script>
+
+// ═══ Start ═══
+const esChat=document.getElementById("chatEmpty");
+modusConnectSocket();
+// Mount the KANBAN board by patching the WorkbenchStore prototype.
+if (typeof ModusKanban !== "undefined") {
+  ModusKanban.mountKanban(document.getElementById("kbBoard"));
+}
+</script>
+</body>
+</html>
