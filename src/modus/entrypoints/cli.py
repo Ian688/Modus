@@ -37,13 +37,8 @@ def desktop_serve(
 ) -> None:
     """启动 Modus Desktop WebSocket 服务"""
     import os
-    import sys
     # PORT 环境变量优先（preview 工具用它分配空闲端口）；显式 --port 覆盖它。
     port = int(os.environ.get("PORT") or port)
-    # 精准移除 Hermes 的污染路径，不动 stdlib 和项目自身
-    HERMES_SRC = "/Users/yinsijie/.hermes/hermes-agent"
-    HERMES_SITE = "/Users/yinsijie/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
-    sys.path = [p for p in sys.path if p not in (HERMES_SRC, HERMES_SITE)]
     from modus.desktop import start_server
     workspace_root = None
     if cwd is not None:

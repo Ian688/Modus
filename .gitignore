@@ -41,4 +41,3 @@ e2e_*.txt
 
 # Session/agent working directories
 .remember/
-.hermes/

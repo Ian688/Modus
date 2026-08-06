@@ -863,6 +863,15 @@ async def _run_peri_body(
                             result_artifact_id=(revision_artifact or {}).get("artifact_id"),
                             increment_attempt=True,
                         )
+                        persist_working_memory(
+                            session_id=session.db_id, run_id=emitter.run_id,
+                            category="worker-revision",
+                            content=(
+                                f"Worker {index + 1} 修订完成（第 {revision_round} 轮）："
+                                f"{bounded_summary(revised, 1_500)}"
+                            ),
+                            source_ids=[revision_artifact["artifact_id"]] if revision_artifact else None,
+                        )
                         for artifact in (revision_artifact, revision_summary_artifact):
                             if (payload := artifact_event_payload(artifact)) is not None:
                                 await emitter.emit(

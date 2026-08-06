@@ -1617,29 +1617,22 @@ def _recompact_over_window(session: DaoSession, compaction: dict[str, Any] | Non
     config = getattr(getattr(session, "engine", None), "config", None)
     if config is None:
         return
-    from modus.agent.compressor import compress_messages
+    from modus.agent.compressor import compression_tail_count, compress_messages, should_compress
 
     window = max(1_024, int(getattr(getattr(config, "llm", None), "max_context_window", 128_000)))
     budget = max(0, window - int(getattr(config.llm, "max_tokens", 8_192)))
     # The client trims toward the window at request time; reserve the summary
     # message so it survives that trim when we must compact here.
-    if sum(_estimate_row_tokens(m) for m in session.main_history) <= budget:
+    # should_compress counts only list-part "text" keys; the old inline
+    # estimator counted whole dicts. Tests use string content, so identical.
+    if not should_compress(session.main_history, threshold=budget):
         return
-    tail_count = max(2, int(getattr(getattr(getattr(config, "features", None), "compression", None), "tail_messages", 8)))
+    tail_count = compression_tail_count(config)
     session.main_history = compress_messages(
         session.main_history,
         summary=str((compaction or {}).get("summary") or ""),
         tail_count=tail_count,
     )
-
-
-def _estimate_row_tokens(message: Message) -> int:
-    """Rough chars/4 estimate for one in-memory message (mirrors DB estimate)."""
-    content = message.content
-    total = len(content) if isinstance(content, str) else len(str(content))
-    for tc in message.tool_calls or []:
-        total += len(json.dumps(tc))
-    return max(1, total // 4)
 
 
 def _ensure_default_models() -> None:
@@ -3376,7 +3369,7 @@ def _maybe_compress_history(
     session: DaoSession, *, run_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Apply configured, instruction-safe context compaction to model context only."""
-    from modus.agent.compressor import compress_messages, should_compress
+    from modus.agent.compressor import compression_tail_count, compress_messages, should_compress
 
     history = session.main_history
     config = getattr(getattr(session, "engine", None), "config", None)
@@ -3386,7 +3379,7 @@ def _maybe_compress_history(
     threshold = max(1, int(getattr(compression, "trigger_tokens", 80_000)))
     if not should_compress(history, threshold=threshold):
         return None
-    tail_count = max(2, int(getattr(compression, "tail_messages", 8)))
+    tail_count = compression_tail_count(config)
     boundary: dict[str, int] | None = None
     if session.db_id:
         from modus.desktop.db import get_context_compaction_boundary

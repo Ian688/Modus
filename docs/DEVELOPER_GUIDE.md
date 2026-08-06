@@ -36,7 +36,6 @@ src/modus/
 
 tests/   后端与契约测试（pytest tests/）
 e2e/     真实浏览器回归（pytest e2e/，独立运行）
-.hermes/ 研究账本（已归档历史快照见 .hermes/archive/）
 ```
 
 ## 3. 前端模块化（重要约定）

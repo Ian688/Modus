@@ -36,6 +36,10 @@ def should_compress(messages: list[Message], threshold: int = 80_000) -> bool:
     """检查是否需要压缩"""
     return estimate_tokens(messages) > threshold
 
+def compression_tail_count(config: Any) -> int:
+    """从引擎配置读取压缩保留尾部条数（默认 8，至少 2）。"""
+    return max(2, int(getattr(getattr(getattr(config, "features", None), "compression", None), "tail_messages", 8)))
+
 def compress_messages(
     messages: list[Message],
     summary: str = "",
