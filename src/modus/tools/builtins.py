@@ -66,6 +66,17 @@ async def read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult
         path = _resolve_path(context, str(payload["path"]))
         offset = max(int(payload.get("offset") or 1), 1)
         limit = int(payload.get("limit") or 500)
+        stat = path.stat()
+        if stat.st_size > 1_000_000:
+            # Match grep/search_code's size boundary: refuse a full read of a
+            # multi-MB file instead of buffering it entirely in memory.  The
+            # model can still grep/search_code into large files.
+            return ToolResult(
+                f"read_file refused: file is {stat.st_size:,} bytes (>1MB); "
+                "use grep or search_code to probe it.",
+                is_error=True,
+                disclosure={"local_bytes_read": 0, "model_bytes_sent": 0},
+            )
         content = path.read_text(encoding="utf-8", errors="replace").splitlines()
         selected = content[offset - 1 : offset - 1 + limit]
         numbered = "\n".join(f"{idx + offset}: {line}" for idx, line in enumerate(selected))
@@ -75,7 +86,7 @@ async def read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult
         return ToolResult(
             numbered,
             disclosure={
-                "local_bytes_read": path.stat().st_size,
+                "local_bytes_read": stat.st_size,
                 "model_bytes_sent": len(selected_text),
                 "raw_content_sent": True,
             },
@@ -515,6 +526,28 @@ def get_builtin_tools() -> list[Tool]:
             timeout=3700.0,
         ),
         Tool(
+            name="revert_turn",
+            description=(
+                "List side-git snapshots (action=list) or restore the workspace "
+                "to a pre-turn snapshot (action=restore, optional commit_id). "
+                "Restores the workspace tree to a state captured before this "
+                "run's mutations began. Never touches the user's own git history."
+            ),
+            parameters=object_schema(
+                {
+                    "action": {"type": "string", "description": "list or restore"},
+                    "commit_id": {"type": "string", "description": "Snapshot commit (restore only)"},
+                },
+                ["action"],
+            ),
+            required_keys=["action"],
+            handler=revert_turn,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="high",
+            requires_approval=True,
+        ),
+        Tool(
             name="web_search",
             description="Search the web for current information.",
             parameters=object_schema(
@@ -576,7 +609,7 @@ def _clone_tools() -> list[Tool]:
             }[name],
             is_read_only=read_only,
             is_concurrency_safe=False,
-            danger_level="high" if high else "medium",
+            danger_level="safe" if read_only else ("high" if high else "medium"),
             requires_approval=not read_only,
         )
 
@@ -594,9 +627,9 @@ def _clone_tools() -> list[Tool]:
         _tool("git_remote_remove", "Remove a non-origin git remote.",
               {"name": {"type": "string", "description": "Remote name"}},
               ["name"], high=True),
-        _tool("git_fetch", "Fetch references from a remote.",
+        _tool("git_fetch", "Fetch references from a remote (mutates the local ref store).",
               {"remote": {"type": "string", "description": "Remote name (optional)"}},
-              [], read_only=True),
+              [], high=True, read_only=False),
         _tool("git_pull", "Pull latest changes from a remote.",
               {"remote": {"type": "string", "description": "Remote (default origin)"},
                "branch": {"type": "string", "description": "Branch (optional)"}},
@@ -1043,11 +1076,39 @@ def _bounded_unified_diff(path: Path, before: str, after: str, *, limit: int = 1
         "deletions": deletions,
     }
 
-# Retained as a private placeholder for the future checkpoint subsystem.
-# Do not register this with ``get_builtin_tools`` until restoration has an
-# auditable snapshot model, conflict handling, and a verified implementation.
 async def revert_turn(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    return ToolResult(f"Snapshot restore feature not yet implemented")
+    """Restore the workspace to a side-git pre-turn snapshot.
+
+    ``action`` is ``list`` (default) or ``restore``.  Restore requires a
+    ``commit_id``; when omitted, the most recent pre-turn snapshot is used.
+    The side repository lives under Modus's own data directory and never
+    touches the user's git history.
+    """
+    from modus.tools.snapshot import list_snapshots, restore_snapshot
+
+    workspace_root = context.workspace_root or context.cwd
+    action = str(payload.get("action") or "list").strip().lower()
+    if action == "list":
+        snaps = list_snapshots(workspace_root, limit=10)
+        if not snaps:
+            return ToolResult("无可用快照。")
+        lines = [f"{s.commit_id[:12]}  {s.phase}  {s.summary}" for s in snaps]
+        return ToolResult("可用快照（最近在前）：\n" + "\n".join(lines))
+    if action == "restore":
+        commit_id = str(payload.get("commit_id") or "").strip()
+        if not commit_id:
+            snaps = list_snapshots(workspace_root, limit=1)
+            if not snaps:
+                return ToolResult("无可用快照，无法恢复。", is_error=True)
+            commit_id = snaps[0].commit_id
+        restored, removed = restore_snapshot(workspace_root, commit_id)
+        return ToolResult(
+            f"已恢复到快照 {commit_id[:12]}（恢复 {restored} 个文件，移除 {removed} 个）。",
+            display_summary="已恢复工作区快照",
+            metadata={"operation": "revert_turn", "commit_id": commit_id,
+                      "restored": restored, "removed": removed},
+        )
+    return ToolResult(f"revert_turn action 必须是 list 或 restore，收到：{action}", is_error=True)
 
 async def web_search(payload: dict[str, Any], _context: ToolContext) -> ToolResult:
     max_results = int(payload.get("max_results") or 5)

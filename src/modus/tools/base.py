@@ -9,8 +9,42 @@ from modus.config import ModusConfig
 
 DangerLevel = Literal["safe", "medium", "high"]
 DataDisclosure = Literal["none", "workspace_metadata", "workspace_content"]
-ToolDecision = Literal["approve", "deny", "skip"]
-ApprovalCallback = Callable[[dict[str, Any]], Awaitable[str] | str]
+ToolDecision = Literal["approve", "deny", "skip", "modify"]
+
+# An approval callback may return a plain decision string, or a structured
+# ApprovalResponse.  ``Any`` keeps the forward reference to ApprovalResponse
+# from being evaluated at module load (it is defined below).
+ApprovalCallback = Callable[[dict[str, Any]], Awaitable[Any] | Any]
+
+
+@dataclass(slots=True)
+class ApprovalResponse:
+    """Structured human-approval decision returned by an approval callback.
+
+    ``decision`` is one of approve/deny/skip/modify.  ``modified_input`` is
+    required for modify: the exact replacement payload the executor will
+    re-validate and re-hash before execution.  deny/skip may carry a ``reason``.
+    """
+
+    decision: ToolDecision
+    modified_input: dict[str, Any] | None = None
+    reason: str = ""
+
+    @classmethod
+    def approve(cls) -> "ApprovalResponse":
+        return cls("approve")
+
+    @classmethod
+    def deny(cls, reason: str = "") -> "ApprovalResponse":
+        return cls("deny", reason=reason)
+
+    @classmethod
+    def skip(cls, reason: str = "") -> "ApprovalResponse":
+        return cls("skip", reason=reason)
+
+    @classmethod
+    def modify(cls, modified_input: dict[str, Any]) -> "ApprovalResponse":
+        return cls("modify", modified_input=modified_input)
 
 @dataclass(slots=True)
 class ToolResult:
@@ -62,6 +96,10 @@ class ToolContext:
     # temporary files land here instead of the user's filesystem when no
     # workspace is bound.
     modus_output_dir: str | None = None
+    # Set by the executor the first time a mutating tool is about to run, after
+    # a side-git pre-turn snapshot has been captured for this run.  Guards
+    # against capturing the same snapshot repeatedly across tool calls.
+    _snapshot_taken: bool = False
 
 @dataclass(slots=True)
 class Tool:

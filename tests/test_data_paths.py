@@ -30,3 +30,21 @@ def test_config_reads_user_file_from_selected_data_directory(tmp_path):
     assert config.llm.model == "from-selected-dir"
     assert config.memory.auto_memorize is False
     assert config.memory.max_retrieval_results == 8
+
+
+def test_retry_transient_env_mapping(tmp_path):
+    config = load_config(
+        project_root=tmp_path,
+        env={"MODUS_RETRY_TRANSIENT": "false"},
+    )
+    assert config.llm.retry_transient is False
+
+    enabled = load_config(
+        project_root=tmp_path,
+        env={"MODUS_RETRY_TRANSIENT": "true"},
+    )
+    assert enabled.llm.retry_transient is True
+
+    # Default is on.
+    default = load_config(project_root=tmp_path, env={})
+    assert default.llm.retry_transient is True

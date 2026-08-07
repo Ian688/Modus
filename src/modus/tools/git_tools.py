@@ -7,30 +7,106 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 from typing import Any
 
 from modus.tools.base import Tool, ToolContext, ToolResult
+
+_SIGKILL = getattr(signal, "SIGKILL", 9)
 
 
 # ── Helpers ──
 
 
 async def _git(cmd: list[str], cwd: str | None = None) -> tuple[str, str, int]:
-    """Run a git command and return (stdout, stderr, exit_code)."""
+    """Run a git command and return (stdout, stderr, exit_code).
+
+    ``git`` may hang on a network op (fetch/pull/push).  The ``Tool`` wrapper
+    bounds the whole handler with a timeout, but a bare ``communicate`` would
+    leave the child git process orphaned on timeout.  Run in a dedicated process
+    group and terminate the whole tree on timeout, mirroring ``bash``.
+    """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
+        return await _run_git(
+            cmd, cwd=cwd,
+            timeout=float(os.environ.get("MODUS_GIT_TOOL_TIMEOUT", "45") or 45),
         )
-        stdout, stderr = await proc.communicate()
-        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"), proc.returncode or 0
     except FileNotFoundError:
         return "", "git not found in PATH", 127
     except Exception as exc:
         return "", str(exc), 1
+
+
+async def _run_git(
+    cmd: list[str], cwd: str | None = None, *, env: dict[str, str] | None = None,
+    timeout: float = 45.0,
+) -> tuple[str, str, int]:
+    """Run one git command in a process group with a hard timeout and cleanup.
+
+    Mirrors ``bash``: the communicate task is shielded from the wait timeout so
+    the process tree can always be terminated and reaped instead of orphaned.
+    """
+    merged_env = dict(os.environ)
+    if env:
+        merged_env.update(env)
+    kwargs: dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=merged_env,
+        **kwargs,
+    )
+    communicate_task = asyncio.create_task(proc.communicate())
+    try:
+        done, _pending = await asyncio.wait(
+            {communicate_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if communicate_task in done:
+            stdout, stderr = communicate_task.result()
+            return (
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
+                proc.returncode or 0,
+            )
+        await _terminate_git_tree(proc, communicate_task)
+        return "", f"git command timed out after {timeout:.0f}s", 124
+    except asyncio.CancelledError:
+        # ``Tool.execute`` may cancel this handler on its own I/O deadline; the
+        # process tree must still be terminated and reaped.
+        await _terminate_git_tree(proc, communicate_task)
+        raise
+
+
+async def _terminate_git_tree(
+    proc: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    """Terminate a git process group and reap its pipe reader."""
+    if proc.returncode is None:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                os.killpg(os.getpgid(proc.pid), _SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        await asyncio.wait_for(asyncio.shield(communicate_task), timeout=1.0)
+    except TimeoutError:
+        if not communicate_task.done():
+            communicate_task.cancel()
+        await asyncio.gather(communicate_task, return_exceptions=True)
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
 
 
 def _fmt_result(stdout: str, stderr: str, exit_code: int) -> str:
@@ -314,19 +390,10 @@ async def _git_with_env(
     cmd: list[str], cwd: str | None = None, *, env: dict[str, str] | None = None,
 ) -> tuple[str, str, int]:
     """Like ``_git`` but accepts extra environment variables (e.g. GIT_ASKPASS)."""
-    merged_env = dict(os.environ)
-    if env:
-        merged_env.update(env)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=cwd, env=merged_env,
-        )
-        stdout, stderr = await proc.communicate()
-        return (
-            stdout.decode("utf-8", errors="replace"),
-            stderr.decode("utf-8", errors="replace"),
-            proc.returncode or 0,
+        return await _run_git(
+            cmd, cwd=cwd, env=env,
+            timeout=float(os.environ.get("MODUS_GIT_TOOL_TIMEOUT", "45") or 45),
         )
     except FileNotFoundError:
         return "", "git not found in PATH", 127

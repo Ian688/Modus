@@ -23,6 +23,9 @@ class LlmConfig:
     supports_tools: bool = True
     max_context_window: int = 128_000
     reasoning_effort: str | None = None
+    # Retry transient provider failures (connect/timeout before any content
+    # delta) once, budget-aware.  Content-bearing streams are never replayed.
+    retry_transient: bool = True
 
 @dataclass(slots=True)  #ToolsConfig — 哪些工具启用/禁用、超时时间、并发读上限
 class ToolsConfig:
@@ -122,6 +125,8 @@ class FeatureConfig:
     writable_workers: bool = False
     park_on_disconnect: bool = False
     billing: bool = False
+    # ast-based diagnostics injected after editing Python files.
+    lsp_diagnostics: bool = True
 
 @dataclass(slots=True)
 class ModusConfig:
@@ -258,7 +263,9 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("SUPPORTS_TOOLS", "llm.supports_tools", lambda v: v.lower() == "true"),
         ("MAX_CONTEXT_WINDOW", "llm.max_context_window", int),
         ("REASONING_EFFORT", "llm.reasoning_effort", str),
+        ("RETRY_TRANSIENT", "llm.retry_transient", lambda v: v.lower() == "true"),
         ("RENDER_MODE", "render_mode", str),
+        ("AGENT_MODE", "prompt.agent_mode", str),
         ("MCP", "features.mcp", lambda v: v.lower() == "true"),
         ("SKILL", "features.skill", lambda v: v.lower() == "true"),
         ("MEMORY", "features.memory", lambda v: v.lower() == "true"),
@@ -270,6 +277,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("WRITABLE_WORKERS", "features.writable_workers", lambda v: v.lower() == "true"),
         ("PARK_ON_DISCONNECT", "features.park_on_disconnect", lambda v: v.lower() == "true"),
         ("BILLING", "features.billing", lambda v: v.lower() == "true"),
+        ("LSP_DIAGNOSTICS", "features.lsp_diagnostics", lambda v: v.lower() == "true"),
         ("CONVERGENCE_ENABLED", "features.convergence.enabled", lambda v: v.lower() == "true"),
         ("MAX_REVISION_ROUNDS", "features.convergence.max_revision_rounds", int),
         ("CONVERGENCE_SEMANTIC_THRESHOLD", "features.convergence.semantic_threshold", float),

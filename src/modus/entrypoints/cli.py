@@ -24,6 +24,107 @@ app = typer.Typer(
 )
 console = Console()
 
+
+def _format_approval_input(data: dict) -> str:
+    """Render a tool-call payload readably without dumping raw secrets.
+
+    One line per top-level key; bash/run_tests show the command prominently,
+    file tools show the path and a bounded content excerpt.  Values are never
+    expanded for keys that look like credentials (token/api_key/secret/...).
+    """
+    secret_keys = {"token", "api_key", "apikey", "secret", "password", "key"}
+    lines: list[str] = []
+    for key, value in (data or {}).items():
+        if any(s in str(key).lower() for s in secret_keys):
+            lines.append(f"  {key}: [red]•••• 已隐藏[/red]")
+            continue
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        if key in {"command", "description"} or len(text) <= 200:
+            lines.append(f"  {key}: {text}")
+        else:
+            lines.append(f"  {key}: {text[:200]}…（共 {len(text)} 字符）")
+    return "\n".join(lines) if lines else "  （无参数）"
+
+
+async def _cli_approval_callback(request: dict) -> str:
+    """Terminal HITL approval: rich card + y/n/s/m decision.
+
+    The executor has already decided this tool needs approval (ApprovalPolicy)
+    and validated it (CommandGuard / PathGuard / input_hash).  This callback is
+    the human confirmation only; returning anything but "approve" fails closed.
+    Decisions:
+      y  approve as-is
+      n  deny (tool reports an error)
+      s  skip (tool does not run; the run continues)
+      m  modify the tool arguments, then approve the edited payload
+    """
+    from rich import box
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+
+    danger = str(request.get("danger_level") or "medium")
+    style = {"high": "red", "medium": "yellow", "safe": "green"}.get(danger, "yellow")
+    tool_name = str(request.get("tool_name") or "工具")
+    lines = [
+        f"[bold]{tool_name}[/bold] 请求执行",
+        f"危险级别: [{style}]{danger}[/{style}]",
+        f"数据披露: {request.get('data_disclosure') or 'none'}",
+    ]
+    if request.get("description"):
+        lines.append(f"描述: {request['description']}")
+    lines.append(f"参数:\n{_format_approval_input(request.get('input') or {})}")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="⚠️ 审批请求", box=box.ROUNDED, border_style=style,
+        )
+    )
+    answer = Prompt.ask(
+        "批准执行? [y]批准 [n]拒绝 [s]跳过 [m]改参",
+        choices=["y", "n", "s", "m"], default="n", show_choices=False,
+    )
+    decision = answer.strip().lower()
+    if decision == "y":
+        return "approve"
+    if decision == "s":
+        return "skip"
+    if decision == "m":
+        modified = _prompt_modified_args(request.get("input") or {})
+        if modified is not None:
+            from modus.tools.base import ApprovalResponse
+
+            return ApprovalResponse.modify(modified)
+        return "deny"  # failed to produce a valid modification
+    return "deny"
+
+
+def _prompt_modified_args(original: dict) -> dict | None:
+    """Let the user edit a tool-call payload as JSON before approving.
+
+    Returns the replacement payload, or None when the user abandons the edit
+    (so the caller fails closed to deny).
+    """
+    from rich.prompt import Prompt
+
+    console.print("[dim]当前参数：[/dim]")
+    console.print(json.dumps(original, ensure_ascii=False, indent=2))
+    console.print("[dim]输入修改后的参数（JSON），或输入 . 放弃：[/dim]")
+    try:
+        raw = Prompt.ask("")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if raw is None or raw.strip() in {"", "."}:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        console.print(f"[red]JSON 解析失败：{exc}，已拒绝。[/red]")
+        return None
+    if not isinstance(parsed, dict):
+        console.print("[red]参数必须是 JSON 对象，已拒绝。[/red]")
+        return None
+    return parsed
+
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"modus {__version__}")
@@ -174,7 +275,9 @@ async def _run_repl(cwd: str, config) -> None:
         if text.lower() in {"exit", "quit", "exit()", "quit()"}:
             break
         try:
-            result = await engine.ask_complete_async(text, history=history)
+            result = await engine.ask_complete_async(
+                text, history=history, approval_callback=_cli_approval_callback,
+            )
         except Exception as exc:
             console.print(f"[red]Error: {exc}[/red]")
             continue
@@ -196,5 +299,5 @@ async def _run_prompt(prompt: str, cwd: str, config) -> None:
         config=config,
         cwd=cwd,
     )
-    result = await engine.ask_complete_async(prompt)
+    result = await engine.ask_complete_async(prompt, approval_callback=_cli_approval_callback)
     typer.echo(result.text)

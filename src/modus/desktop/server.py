@@ -1346,6 +1346,33 @@ async def _handle_workbench_get(
 command_router.register("workbench_get", _handle_workbench_get)
 
 
+async def _handle_kanban_board(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Serve the KANBAN board aggregation for the current session.
+
+    Read-only, mode-independent, derived from the same semantic projections the
+    Workbench serves.  The board never executes work and never mutates state.
+    """
+    from modus.desktop.board_aggregation import aggregate_board
+
+    request_id = str(message.get("request_id") or "")[:128]
+    runs: list[dict[str, Any]] = []
+    if session.db_id:
+        snapshot = build_workbench_snapshot(session.db_id)
+        runs = snapshot.get("runs") or []
+    board = aggregate_board(runs)
+    await websocket.send_json({
+        "type": "kanban_board",
+        "operation": "kanban_board", "request_id": request_id,
+        "session_id": str(session.db_id or ""),
+        "board": board,
+    })
+
+
+command_router.register("kanban_board", _handle_kanban_board)
+
+
 async def _handle_credential_migration_report(
     websocket: WebSocket, session: DaoSession, message: dict[str, Any],
 ) -> None:

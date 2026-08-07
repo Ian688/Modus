@@ -60,11 +60,11 @@ class QueryEngine:
         ):
             yield event
 
-    async def ask_complete_async(self, message: str, history: list[Message] | None = None) -> QueryResult:
+    async def ask_complete_async(self, message: str, history: list[Message] | None = None, *, approval_callback=None) -> QueryResult:
         text = ""
         tokens = 0
         turns = 0
-        async for event in self.ask(message, history):
+        async for event in self.ask(message, history, approval_callback=approval_callback):
             if event.get("type") == "text_delta":
                 text += str(event.get("text") or "")
             elif event.get("type") == "done":

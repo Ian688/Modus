@@ -11,10 +11,20 @@ async def build_tool_registry(
     extension_registry: ExtensionRegistry | None = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
+    builtin = get_builtin_tools()
+    allowed = set(config.tools.enabled or ())
+    blocked = set(config.tools.disabled or ())
+    if allowed:
+        builtin = [tool for tool in builtin if tool.name in allowed]
+    if blocked:
+        builtin = [tool for tool in builtin if tool.name not in blocked]
+    registry.register_all(builtin)
     # Desktop supplies its process-owned registry so connected MCP servers are
     # part of the actual Agent tool catalog. CLI callers keep an isolated
     # registry unless they explicitly provide another lifecycle owner.
     extensions = extension_registry or ExtensionRegistry()
-    registry.register_all(await extensions.contribute_tools(config, cwd))
+    contributed = await extensions.contribute_tools(config, cwd)
+    if blocked:
+        contributed = [tool for tool in contributed if tool.name not in blocked]
+    registry.register_all(contributed)
     return registry

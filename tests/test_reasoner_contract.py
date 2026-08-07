@@ -187,3 +187,279 @@ def test_context_provider_does_not_require_message_param():
     with pytest.raises(TypeError):
         SessionContextProvider().effective_history(_StubSession(), message="hi")
 
+
+
+@pytest.mark.asyncio
+async def test_react_reasoner_attributes_usage_to_host_ledger():
+    """Default loop usage lands in usage_ledger under host:react (MOA/Peri parity)."""
+    from modus.agent.strategies import ReActReasoner
+
+    reasoner = ReActReasoner(
+        llm_client=FakeClient(),
+        tool_registry=_registry(),
+        system_prompt="sys",
+        cwd="/tmp",
+        config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="hi")])]
+    done = events[-1]
+
+    ledger = done["budget"]["usage_ledger"]
+    assert "host:react" in ledger
+    assert ledger["host:react"]["input_tokens"] > 0
+    # Totals stay authoritative.
+    assert done["budget"]["total_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_react_reasoner_enforces_wall_time_mid_stream():
+    """A provider that stalls mid-stream stops with stop_reason=wall_time."""
+    import asyncio
+    from modus.agent.strategies import ReActReasoner
+    from modus.runtime.budget import RunBudget, RunLimits
+
+    provider_reaped = asyncio.Event()
+
+    class StallingClient:
+        model_name = "test"
+        provider_name = "test"
+        max_context_window = 8_192
+
+        async def chat(self, messages, tools, *, system_prompt):
+            try:
+                await asyncio.Event().wait()
+                yield {"type": "text_delta", "text": "too late"}
+            finally:
+                provider_reaped.set()
+
+    budget = RunBudget(RunLimits(max_wall_seconds=0.1))
+    reasoner = ReActReasoner(
+        llm_client=StallingClient(),
+        tool_registry=ToolRegistry(),
+        system_prompt="sys",
+        cwd="/tmp",
+        config=ModusConfig(),
+        budget=budget,
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="wait")])]
+
+    assert provider_reaped.is_set()
+    error = next(ev for ev in events if ev["type"] == "error")
+    assert error["stop_reason"] == "wall_time"
+    assert error["budget"]["stop_reason"] == "wall_time"
+
+
+@pytest.mark.asyncio
+async def test_react_reasoner_compacts_mid_run_over_budget():
+    """A long run compacts its in-loop messages before the next model call."""
+    from modus.config import CompressionConfig, FeatureConfig
+    from modus.agent.strategies import ReActReasoner
+
+    cfg = ModusConfig()
+    cfg.features.compression = CompressionConfig(enabled=True, trigger_tokens=100, tail_messages=4)
+    cfg.features = FeatureConfig(compression=cfg.features.compression)
+
+    # A client that first emits a tool call, then answers after the tool result,
+    # so the loop runs more than one turn and the message list can grow.
+    class ToolClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            if not any(m.role == "tool" for m in messages):
+                yield {
+                    "type": "tool_call_delta", "tool_call": {
+                        "index": 0, "id": "t1",
+                        "function": {"name": "echo", "arguments": '{"text":"hi"}'},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            yield {"type": "text_delta", "text": "done"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = ReActReasoner(
+        llm_client=ToolClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=cfg,
+    )
+    # Pad the context so the first turn is already over budget.
+    padded = [Message(role="user", content="x" * 500) for _ in range(6)]
+    events = [ev async for ev in reasoner.run([*padded, Message(role="user", content="go")])]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    final_messages = done["messages"]
+    # Compaction kept the run going and produced a summary marker.
+    assert any(
+        "[CONTEXT COMPACTION" in str(m.content) for m in final_messages if m.role == "system"
+    )
+    assert done["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_identity_persistence_survives_mid_run_compaction():
+    """New-turn messages survive mid-run compaction when persisted by identity.
+
+    Mirrors default_runner's pre_run_ids filter: compaction reuses tail messages
+    by reference and creates fresh objects for new turns, so identity filtering
+    separates what belongs to this run from what was already persisted.
+    """
+    from modus.config import CompressionConfig, FeatureConfig
+    from modus.agent.strategies import ReActReasoner
+
+    cfg = ModusConfig()
+    cfg.features = FeatureConfig(compression=CompressionConfig(
+        enabled=True, trigger_tokens=100, tail_messages=4,
+    ))
+
+    class ToolClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            if not any(m.role == "tool" for m in messages):
+                yield {
+                    "type": "tool_call_delta", "tool_call": {
+                        "index": 0, "id": "t1",
+                        "function": {"name": "echo", "arguments": '{"text":"hi"}'},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            yield {"type": "text_delta", "text": "done"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = ReActReasoner(
+        llm_client=ToolClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=cfg,
+    )
+    # Pre-run context is padded enough that the first model call compacts it.
+    pre_run = [Message(role="user", content="x" * 400) for _ in range(8)]
+    pre_run_ids = {id(m) for m in pre_run}
+    events = [ev async for ev in reasoner.run([*pre_run, Message(role="user", content="go")])]
+
+    done = events[-1]
+    new_history = [m for m in done["messages"] if id(m) not in pre_run_ids]
+
+    # Compaction happened (summary marker present) and the run's own turns are
+    # still identifiable by identity.
+    assert any(
+        "[CONTEXT COMPACTION" in str(m.content) for m in done["messages"] if m.role == "system"
+    )
+    assert any(m.role == "tool" for m in new_history)
+    assert any(m.role == "assistant" for m in new_history)
+    assert any(m.role == "user" and "go" in str(m.content) for m in new_history)
+
+
+@pytest.mark.asyncio
+async def test_react_injects_python_diagnostics_after_edit(tmp_path, monkeypatch):
+    """Editing a broken .py file injects ast diagnostics into the next turn."""
+    import os
+    from modus.agent.strategies import ReActReasoner
+
+    target = tmp_path / "broken.py"
+    target.write_text("def ok():\n    return 1\n", encoding="utf-8")
+
+    # A client that first calls write_file with a broken payload, then answers.
+    class EditClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            if not any(m.role == "tool" for m in messages):
+                yield {
+                    "type": "tool_call_delta", "tool_call": {
+                        "index": 0, "id": "w1",
+                        "function": {"name": "write_file", "arguments": (
+                            '{"path":"broken.py","content":"def broken(:\\n"}'
+                        )},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            yield {"type": "text_delta", "text": "fixed now"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    async def write_handler(payload, ctx):
+        path = os.path.join(ctx.cwd, payload["path"])
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(payload["content"])
+        from modus.tools.base import ToolResult
+        return ToolResult(
+            "Wrote file",
+            metadata={"operation": "write", "path": "broken.py", "changed": True},
+        )
+
+    from modus.tools.base import Tool, ToolResult, object_schema
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="write_file", description="w", handler=write_handler,
+        parameters=object_schema({"path": {}, "content": {}}, ["path", "content"]),
+        required_keys=["path", "content"], is_read_only=False, danger_level="medium",
+        requires_approval=False,
+    ))
+    # write_file is medium -> ASK by policy; make it auto-allow.
+    from modus.config import PolicyConfig
+    cfg = ModusConfig()
+    cfg.policy = PolicyConfig(hitl_mode="always" if False else "auto")
+
+    reasoner = ReActReasoner(
+        llm_client=EditClient(), tool_registry=registry,
+        system_prompt="sys", cwd=str(tmp_path), config=cfg,
+    )
+    events = [ev async for ev in reasoner.run(
+        [Message(role="user", content="edit")],
+        approval_callback=lambda _req: "approve",
+    )]
+
+    done = events[-1]
+    msgs = done["messages"]
+    assert any(
+        "LSP DIAGNOSTICS" in str(m.content) for m in msgs if m.role == "user"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_subtask_available_when_recursion_enabled():
+    """max_recursion_depth>0 exposes spawn_subtask in the default loop."""
+    from modus.config import ConvergenceConfig, FeatureConfig
+    from modus.agent.strategies import ReActReasoner
+
+    cfg = ModusConfig()
+    cfg.features = FeatureConfig(convergence=ConvergenceConfig(max_recursion_depth=1))
+
+    class ChildClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            names = [t["function"]["name"] for t in (tools or [])]
+            assert "spawn_subtask" in names, "spawn_subtask must be in the tool catalog"
+            if not any(m.role == "tool" for m in messages):
+                yield {
+                    "type": "tool_call_delta", "tool_call": {
+                        "index": 0, "id": "sp1",
+                        "function": {"name": "spawn_subtask", "arguments": (
+                            '{"description":"child work"}'
+                        )},
+                    },
+                }
+                yield {"type": "message_end", "stop_reason": "tool_use"}
+                return
+            yield {"type": "text_delta", "text": "child done"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = ReActReasoner(
+        llm_client=ChildClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=cfg,
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="parent")])]
+
+    types = [ev["type"] for ev in events]
+    assert "tool_call" in types
+    # The parent then sees the child's text result in a tool_result.
+    assert events[-1]["type"] == "done"

@@ -102,3 +102,26 @@ def test_remote_tools_registered_in_builtins():
     assert by_name["git_clone"].requires_approval is True
     assert by_name["git_push"].requires_approval is True
     assert by_name["git_remote_list"].requires_approval is False
+
+
+def test_run_git_times_out_and_terminates_process_group():
+    """A hanging git command is killed, not orphaned, and reports exit 124."""
+    result = asyncio.run(gt._run_git(
+        ["sleep", "10"],
+        cwd=os.getcwd(),
+        timeout=0.3,
+    ))
+    stdout, stderr, code = result
+    assert code == 124
+    assert "timed out" in stderr
+
+
+def test_git_fetch_requires_approval_and_is_not_read_only():
+    """git_fetch mutates the local ref store, so it must be approval-gated."""
+    from modus.tools.builtins import _clone_tools
+
+    tools = _clone_tools()
+    by_name = {t.name: t for t in tools}
+    fetch = by_name["git_fetch"]
+    assert fetch.requires_approval is True
+    assert fetch.is_read_only is False

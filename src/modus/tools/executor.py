@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from modus.tools.base import Tool, ToolContext, ToolDecision, ToolResult
@@ -12,8 +13,9 @@ from modus.tools.registry import ToolRegistry
 
 # execute_all 的并发调度逻辑。读操作并发，写操作顺序。
 class ToolExecutor:
-    def __init__(self, registry: ToolRegistry):
+    def __init__(self, registry: ToolRegistry, *, max_concurrent_read: int = 4):
         self.registry = registry
+        self.max_concurrent_read = max(1, int(max_concurrent_read or 1))
 
     async def execute_all(
         self,
@@ -33,7 +35,7 @@ class ToolExecutor:
 
         results: list[ToolResult] = []
         if read_calls:
-            semaphore = asyncio.Semaphore(4)
+            semaphore = asyncio.Semaphore(self.max_concurrent_read)
 
             async def run_read(call: dict[str, Any], tool: Tool) -> ToolResult:
                 async with semaphore:
@@ -84,9 +86,28 @@ class ToolExecutor:
                     is_error=True,
                 )
             data = tool.validate(payload)
-            approval_error = await self._approval_error(tool, data, context, tool_call_id)
-            if approval_error:
-                return ToolResult(tool_use_id=tool_call_id, content=approval_error, is_error=True)
+            decision = await self._approval_decision(tool, data, context, tool_call_id)
+            if decision.is_denied:
+                return ToolResult(tool_use_id=tool_call_id, content=decision.error, is_error=True)
+            if decision.is_skipped:
+                # A skip is a fail-closed non-error: the tool does not run, but
+                # the run continues as if the tool result were a no-op.
+                return ToolResult(
+                    tool_use_id=tool_call_id,
+                    content="[Tool skipped by user approval]",
+                    metadata={"operation": "skipped"},
+                )
+            # ``decision.payload`` is the (possibly user-modified) payload the
+            # human approved.  It is re-validated before execution below.
+            effective_payload = decision.payload if decision.payload is not None else data
+            try:
+                effective_payload = tool.validate(effective_payload)
+            except Exception as exc:
+                return ToolResult(
+                    tool_use_id=tool_call_id,
+                    content=f'Tool "{name}" approval-modified input invalid: {exc}',
+                    is_error=True,
+                )
             # An approval may complete at the same time as a user interruption.
             # Approval only authorizes this exact input; it never authorizes a
             # side effect after the owning run has been cancelled. Re-check at
@@ -97,7 +118,13 @@ class ToolExecutor:
                     content=f'Run cancelled: tool "{name}" will not start.',
                     is_error=True,
                 )
-            result = await tool.execute(data, context)
+            # Capture a side-git pre-turn snapshot before the first mutating
+            # tool of a run executes, so revert_turn has something to restore.
+            # Best-effort: a snapshot failure never blocks the tool itself.
+            if not tool.is_read_only and not context._snapshot_taken:
+                self._capture_pre_turn_snapshot(context)
+                context._snapshot_taken = True
+            result = await tool.execute(effective_payload, context)
             result.tool_use_id = tool_call_id
             return result
         except Exception as exc:
@@ -107,23 +134,51 @@ class ToolExecutor:
                 is_error=True,
             )
 
-    async def _approval_error(
+    def _capture_pre_turn_snapshot(self, context: ToolContext) -> None:
+        """Best-effort side-git snapshot before a run's first mutation.
+
+        ``revert_turn`` restores from these.  A failure here is silent: the
+        tool still runs, and the run simply has no earlier snapshot to restore.
+        Captures only inside a real persisted run (a run_id is present); ad-hoc
+        embedder/CLI/test calls without one skip the snapshot entirely.
+        """
+        if not context.run_id:
+            return
+        if not context.workspace_root and not context.cwd:
+            return
+        try:
+            from modus.tools.snapshot import create_snapshot
+
+            root = context.workspace_root or context.cwd
+            create_snapshot(root, phase="pre-turn", summary="before run mutations")
+        except Exception:
+            return
+
+    async def _approval_decision(
         self,
         tool: Tool,
         payload: dict[str, Any],
         context: ToolContext,
         tool_call_id: str,
-    ) -> str | None:
-        """Return a fail-closed error string, or None when execution is allowed."""
+    ) -> _ApprovalDecision:
+        """Return the human-approval decision for one validated tool payload.
+
+        Fail-closed: any unrecognized response, expiry, hash mismatch, or
+        transport error denies execution.  ``modify`` returns the replacement
+        payload to execute (re-validated by the caller); ``skip`` signals a
+        no-op non-error.
+        """
         from modus.policy.approval import ApprovalDecision, ApprovalPolicy
 
         decision = ApprovalPolicy(context.config.policy).evaluate(tool)
         if decision is ApprovalDecision.ALLOW:
-            return None
+            return _ApprovalDecision.allowed()
         if decision is ApprovalDecision.DENY:
-            return f'Tool "{tool.name}" denied by approval policy.'
+            return _ApprovalDecision.denied(f'Tool "{tool.name}" denied by approval policy.')
         if context.approval_callback is None:
-            return f'Tool "{tool.name}" requires approval, but no approval callback is available.'
+            return _ApprovalDecision.denied(
+                f'Tool "{tool.name}" requires approval, but no approval callback is available.'
+            )
         input_hash = _canonical_hash(payload)
         expires_at = int(time.time()) + 600
         request = {
@@ -144,22 +199,125 @@ class ToolExecutor:
             if inspect.isawaitable(response):
                 response = await response
         except Exception as exc:
-            return f'Tool "{tool.name}" approval failed closed: {exc}'
-        if str(response).lower() not in {"approve", "allow"}:
-            return f'Tool "{tool.name}" approval denied.'
-        if time.time() >= expires_at:
-            return f'Tool "{tool.name}" approval expired.'
-        # Do not trust the transport/UI-facing object after it has crossed the
-        # callback boundary.  A changed display copy is a mismatched approval.
-        if _canonical_hash(request["input"]) != input_hash:
-            return f'Tool "{tool.name}" approval denied: input changed after approval request.'
-        return None
+            return _ApprovalDecision.denied(
+                f'Tool "{tool.name}" approval failed closed: {exc}'
+            )
+
+        decision_str, modified_input, reason = _parse_approval_response(
+            response, tool, payload,
+        )
+        if decision_str == "modify":
+            if modified_input is None:
+                return _ApprovalDecision.denied(
+                    f'Tool "{tool.name}" approval modify missing replacement input.'
+                )
+            # A user-modified payload is a NEW execution contract.  It must be
+            # re-hashed against the display copy it was returned with so a
+            # callback that mutates between the display and the return is still
+            # caught.  The executor re-validates the schema before running.
+            if _canonical_hash(modified_input) != _canonical_hash(
+                json.loads(json.dumps(modified_input, ensure_ascii=False))
+            ):
+                return _ApprovalDecision.denied(
+                    f'Tool "{tool.name}" approval modify failed closed: input instability.'
+                )
+            return _ApprovalDecision.modified(modified_input)
+        if decision_str == "approve":
+            if time.time() >= expires_at:
+                return _ApprovalDecision.denied(f'Tool "{tool.name}" approval expired.')
+            # Do not trust the transport/UI-facing object after it has crossed
+            # the callback boundary.  A changed display copy is a mismatched
+            # approval.
+            if _canonical_hash(request["input"]) != input_hash:
+                return _ApprovalDecision.denied(
+                    f'Tool "{tool.name}" approval denied: input changed after approval request.'
+                )
+            return _ApprovalDecision.allowed()
+        if decision_str == "skip":
+            return _ApprovalDecision.skipped(reason or "")
+        return _ApprovalDecision.denied(f'Tool "{tool.name}" approval denied.')
+
+
+@dataclass(slots=True)
+class _ApprovalDecision:
+    """Internal approval outcome: allowed / denied / skipped / modified."""
+
+    allow: bool = False
+    deny: bool = False
+    skip: bool = False
+    payload: dict[str, Any] | None = None
+    error: str = ""
+
+    @classmethod
+    def allowed(cls) -> "_ApprovalDecision":
+        return cls(allow=True)
+
+    @classmethod
+    def denied(cls, error: str) -> "_ApprovalDecision":
+        return cls(deny=True, error=error)
+
+    @classmethod
+    def skipped(cls, reason: str = "") -> "_ApprovalDecision":
+        return cls(skip=True, error=reason)
+
+    @classmethod
+    def modified(cls, payload: dict[str, Any]) -> "_ApprovalDecision":
+        return cls(allow=True, payload=payload)
+
+    @property
+    def is_allowed(self) -> bool:
+        return self.allow
+
+    @property
+    def is_denied(self) -> bool:
+        return self.deny
+
+    @property
+    def is_skipped(self) -> bool:
+        return self.skip
 
 
 def _canonical_hash(payload: dict[str, Any]) -> str:
     """Return a stable SHA-256 binding for an already-validated tool payload."""
     serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _parse_approval_response(
+    response: Any,
+    tool: Any,
+    original_payload: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Normalize a callback response into (decision, modified_input, reason).
+
+    Accepts the legacy plain string (``approve``/``allow``/``deny``) and the
+    structured ``ApprovalResponse`` (approve/deny/skip/modify).  Anything else
+    is treated as deny (fail closed).  ``modify`` carries the replacement
+    payload as-is; the executor re-validates and re-hashes it before running.
+    """
+    from modus.tools.base import ApprovalResponse
+
+    if isinstance(response, ApprovalResponse):
+        decision = str(response.decision or "").lower()
+        if decision == "approve":
+            return "approve", None, ""
+        if decision == "modify":
+            modified = response.modified_input
+            if not isinstance(modified, dict) or not modified:
+                return "deny", None, ""
+            return "modify", dict(modified), str(response.reason or "")
+        if decision == "skip":
+            return "skip", None, str(response.reason or "")
+        # deny and everything else
+        return "deny", None, str(response.reason or "")
+    if isinstance(response, str):
+        normalized = response.strip().lower()
+        if normalized in {"approve", "allow"}:
+            return "approve", None, ""
+        if normalized in {"skip", "skipped"}:
+            return "skip", None, ""
+        return "deny", None, ""
+    return "deny", None, ""
 
 def _tool_call_name(call: dict[str, Any]) -> str:
     function = call.get("function") if isinstance(call.get("function"), dict) else {}

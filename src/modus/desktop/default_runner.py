@@ -55,6 +55,38 @@ async def _maybe_consolidate(session: Any, user_message: str) -> None:
         logger.debug("auto-memorize consolidation failed", exc_info=True)
 
 
+async def _persist_self_report(session: Any, run_id: str | None) -> None:
+    """Persist the model's fenced plan/steps/summary/insight blocks as working memory.
+
+    The agent's own framing of a run (its plan, executed steps, closing status,
+    and any insight) currently dies with the turn.  Parsing those fenced blocks
+    best-effort and writing them as run-scope working memory makes them visible
+    to later turns (``get_memory_context`` injects recent working memory) and to
+    the KANBAN projection.  Never raises: a malformed or absent block is a no-op.
+    """
+    if not session.db_id or not run_id:
+        return
+    try:
+        from modus.agent.self_report import summarize_turn_blocks
+        from modus.desktop.db import get_latest_assistant_message
+        from modus.desktop.orchestration_ledger import persist_working_memory
+
+        assistant_text = get_latest_assistant_message(session.db_id) or ""
+        blocks = summarize_turn_blocks(assistant_text)
+        if not blocks:
+            return
+        persist_working_memory(
+            session_id=session.db_id, run_id=run_id,
+            category="self-report",
+            content="Agent 自述：\n" + "\n".join(
+                f"{key}: {value}"
+                for key, value in blocks.items()
+            ),
+        )
+    except Exception:
+        logger.debug("self-report persistence failed", exc_info=True)
+
+
 def _settle_terminal_fallback(
     session: Any, event: Any,
 ) -> bool:
@@ -276,10 +308,20 @@ async def stream_to_ws(
 
     context_provider = SessionContextProvider()
     memory_message = None
-    effective_history = context_provider.effective_history(session, transient=transient_context)
+    effective_history = context_provider.effective_history(
+        session,
+        transient=transient_context,
+        episodic_query=message,
+        current_run_id=emitter.run_id,
+    )
     memory_context = context_provider.memory_text(session.db_id)
     if memory_context:
         memory_message = Message(role="system", content=memory_context)
+    # Identity set of the pre-run context.  Mid-run compaction in the reasoner
+    # can replace the in-loop message list, so locating this run's new turns by
+    # index is unsafe; message identity survives compaction because tail
+    # messages are reused by reference and new turns are fresh objects.
+    pre_run_ids = {id(message) for message in effective_history}
     history_length_before_run = len(session.main_history) + len(transient_context or []) + (1 if memory_message else 0)
     try:
         if session.engine is None:
@@ -384,10 +426,13 @@ async def stream_to_ws(
                 }
                 controller.budget.finish(reason_map.get(stop_reason, StopReason.FAILED))
                 returned_history = list(event.get("messages") or [])
-                # ``messages`` is a full model-context snapshot.
-                # A defensive fallback keeps a user turn visible even when a
-                # lightweight provider returns no context snapshot.
-                new_history = returned_history[history_length_before_run:]
+                # ``messages`` is a full model-context snapshot.  A defensive
+                # fallback keeps a user turn visible even when a lightweight
+                # provider returns no context snapshot.
+                new_history = [
+                    message for message in returned_history
+                    if id(message) not in pre_run_ids
+                ]
                 if not new_history:
                     returned_history = [*session.main_history, Message(role="user", content=message)]
                     new_history = [returned_history[-1]]
@@ -438,6 +483,7 @@ async def stream_to_ws(
                         getattr(getattr(session, "engine", None), "config", None), "memory", None
                     ) is not None:
                         await _maybe_consolidate(session, message)
+                    await _persist_self_report(session, emitter.run_id)
                 elif stop_reason in {"max_turns", "token_limit", "wall_time"}:
                     await emitter.emit(
                         EventType.RUN_ERROR, ChannelId.USER_HOST, Actor.system(),

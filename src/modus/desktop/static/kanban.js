@@ -143,6 +143,16 @@
   }
 
   // ─── Board ───
+  function columnAttentionCount(cards) {
+    // Cards that need a human decision or are blocked, per column.
+    return (cards || []).reduce(function (count, run) {
+      const outcome = (run.semantic && run.semantic.outcome) || {};
+      const attention = String(outcome.attention || "");
+      if (attention === "blocked" || attention === "action_required") return count + 1;
+      return count;
+    }, 0);
+  }
+
   function boardHtml(runs, selectedRunId) {
     const byColumn = {};
     COLUMNS.forEach(function (col) { byColumn[col.key] = []; });
@@ -156,8 +166,14 @@
         const sel = run.run_id && run.run_id === selectedRunId ? ' data-selected="true"' : "";
         return '<div class="kb-card-wrap"' + sel + ">" + cardHtml(run) + "</div>";
       }).join("");
+      const attention = columnAttentionCount(cards);
+      const attentionMark = attention
+        ? '<i class="kb-col-attention" data-kb-attention="' + col.key + '" title="' + attention + ' 项需要关注">⚠ ' + attention + "</i>"
+        : "";
       return '<section class="kb-column" data-kb-column="' + col.key + '">'
-        + '<div class="kb-col-head"><span>' + html(col.label) + '</span><em data-kb-count="' + col.key + '">' + cards.length + "</em></div>"
+        + '<div class="kb-col-head"><span>' + html(col.label) + '</span><em data-kb-count="' + col.key + '">' + cards.length + "</em>"
+        + attentionMark
+        + "</div>"
         + '<div class="kb-col-body">' + (cardHtmlList || '<div class="kb-col-empty">—</div>') + "</div>"
         + "</section>";
     }).join("");

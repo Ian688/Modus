@@ -43,8 +43,8 @@ class PromptAssembler:
             ),
             "- A selected workspace is a local data source, not blanket permission to upload its contents.",
             "- Decide the smallest useful data flow from the user's goal: prefer bounded local metadata or local computation, then report only the necessary aggregate result.",
-            "- list_dir and glob expose bounded names/structure metadata. read_file, grep, and search_code put file content or excerpts into the current model context and therefore require a user approval card with the exact scope.",
-            "- If raw content is genuinely needed, call the precise content-reading tool; the system will ask the user. Never recursively read an entire large workspace or imply that selecting a folder uploads it.",
+            "- list_dir and glob expose bounded names/structure metadata. read_file, grep, and search_code put file content or excerpts into the current model context; the system records that disclosure in the audit trail.",
+            "- If raw content is genuinely needed, call the precise content-reading tool directly; the system reports the disclosure scope. Never recursively read an entire large workspace or imply that selecting a folder uploads it.",
             "- Side-effect tools (write_file, edit_file, bash, run_tests, web_fetch) must be called directly when needed. "
             "The system handles approval by presenting an approval card with the exact parameters.",
             "- Do not ask for permission in your text response and do not wait for a textual confirmation. "

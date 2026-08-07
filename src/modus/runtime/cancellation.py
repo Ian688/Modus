@@ -25,7 +25,10 @@ async def await_or_cancel(
     prevents detached provider/worker tasks from emitting late events.
     """
     if cancel_event is None:
-        return await awaitable
+        # No external cancel token: still honor the run budget's wall-clock
+        # deadline.  A never-set placeholder keeps the single wait path below;
+        # its cancel branch can never win because the event is never set.
+        cancel_event = asyncio.Event()
     if cancel_event.is_set():
         if asyncio.iscoroutine(awaitable):
             awaitable.close()
@@ -62,7 +65,10 @@ async def await_or_cancel(
         cancelled.cancel()
         if deadline is not None:
             deadline.cancel()
-        await asyncio.gather(
-            work, cancelled, *([deadline] if deadline is not None else []),
-            return_exceptions=True,
+        # Reaping must never hang the run: a child that ignores cancellation
+        # (e.g. a generator blocked inside an ``Event().wait()`` that never
+        # returns) is bounded with a short wait, not awaited forever.
+        await asyncio.wait(
+            {work, cancelled, *([deadline] if deadline is not None else [])},
+            timeout=1.0,
         )

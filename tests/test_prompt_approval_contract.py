@@ -28,7 +28,7 @@ def test_system_prompt_distinguishes_read_only_and_side_effect_tool_behavior():
     ).build()
 
     assert "local data source" in prompt.lower()
-    assert "require a user approval card" in prompt.lower()
+    assert "disclosure scope" in prompt.lower()
     assert "never recursively read an entire large workspace" in prompt.lower()
     assert "side-effect tools" in prompt.lower()
     assert "system handles approval" in prompt.lower()

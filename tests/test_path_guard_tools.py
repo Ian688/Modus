@@ -96,6 +96,38 @@ async def test_file_tools_allow_normal_relative_workspace_paths(guard_home):
 
 
 @pytest.mark.asyncio
+async def test_read_file_refuses_multimegabyte_files(guard_home):
+    workspace = guard_home / "workspace"
+    workspace.mkdir()
+    big = workspace / "big.txt"
+    big.write_bytes(b"x" * (1_000_001))
+    ctx = context(workspace)
+
+    result = await read_file({"path": "big.txt"}, ctx)
+
+    assert result.is_error is True
+    assert ">1MB" in result.content
+    assert "grep" in result.content
+
+
+@pytest.mark.asyncio
+async def test_read_file_bounds_line_selection_and_disclosure(guard_home):
+    workspace = guard_home / "workspace"
+    workspace.mkdir()
+    small = workspace / "small.txt"
+    small.write_text("\n".join(f"line {i}" for i in range(1, 101)), encoding="utf-8")
+    ctx = context(workspace)
+
+    result = await read_file({"path": "small.txt", "offset": 2, "limit": 3}, ctx)
+
+    assert not result.is_error
+    assert result.content.startswith("2: line 2")
+    assert result.content.endswith("4: line 4")
+    # Disclosure counts only the selected slice, not the whole file.
+    assert result.disclosure["model_bytes_sent"] == len("line 2\nline 3\nline 4")
+
+
+@pytest.mark.asyncio
 async def test_write_file_is_atomic_and_preserves_existing_mode(guard_home):
     workspace = guard_home / "workspace"
     workspace.mkdir()

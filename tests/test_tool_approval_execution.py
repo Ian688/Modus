@@ -167,3 +167,79 @@ async def test_malformed_tool_arguments_are_rejected_before_approval_callback():
     assert result.is_error is True
     assert called is False
     assert "invalid_json" in result.content
+
+
+@pytest.mark.asyncio
+async def test_approval_modify_executes_with_replacement_payload():
+    """A MODIFIED decision re-validates and executes the user-edited payload."""
+    from modus.tools.base import ApprovalResponse
+
+    executed_payload = {}
+
+    async def handler(payload, _context):
+        nonlocal executed_payload
+        executed_payload = dict(payload)
+        return ToolResult("modified-ran")
+
+    async def modify(_request):
+        return ApprovalResponse.modify({"command": "echo replaced"})
+
+    tool = Tool("tool", "shell", object_schema({"command": {"type": "string"}}, ["command"]),
+                handler, is_read_only=False, danger_level="high", requires_approval=True)
+    call = {"id": "call-mod", "function": {"name": "tool", "arguments": '{"command":"echo original"}'}}
+    result = (await _executor(tool).execute_all([call], _context(modify)))[0]
+
+    assert result.is_error is False
+    assert executed_payload == {"command": "echo replaced"}
+    assert result.content == "modified-ran"
+
+
+@pytest.mark.asyncio
+async def test_approval_modify_rejects_invalid_replacement():
+    """A MODIFIED payload that fails schema re-validation is denied."""
+    from modus.tools.base import ApprovalResponse
+
+    executed = False
+
+    async def handler(_payload, _context):
+        nonlocal executed
+        executed = True
+        return ToolResult("should not run")
+
+    async def modify(_request):
+        # Missing the required ``command`` key.
+        return ApprovalResponse.modify({"other": "x"})
+
+    tool = Tool("tool", "shell", object_schema({"command": {"type": "string"}}, ["command"]),
+                handler, is_read_only=False, danger_level="high", requires_approval=True,
+                required_keys=["command"])
+    call = {"id": "call-mod-bad", "function": {"name": "tool", "arguments": '{"command":"echo ok"}'}}
+    result = (await _executor(tool).execute_all([call], _context(modify)))[0]
+
+    assert executed is False
+    assert result.is_error is True
+    assert "approval-modified" in result.content.lower()
+
+
+@pytest.mark.asyncio
+async def test_approval_skip_is_noop_non_error():
+    """A SKIPPED decision does not execute but is not reported as a failure."""
+    from modus.tools.base import ApprovalResponse
+
+    executed = False
+
+    async def handler(_payload, _context):
+        nonlocal executed
+        executed = True
+        return ToolResult("should not run")
+
+    async def skip(_request):
+        return ApprovalResponse.skip("user chose to skip")
+
+    tool = Tool("tool", "shell", object_schema({}), handler,
+                is_read_only=False, danger_level="high", requires_approval=True)
+    result = (await _executor(tool).execute_all([_call()], _context(skip)))[0]
+
+    assert executed is False
+    assert result.is_error is False
+    assert "skipped" in result.content.lower()

@@ -39,9 +39,15 @@ class Agent:
         run_id: str | None = None,
         reasoner_factory: Callable[..., Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        from modus.agent.strategies import ReActReasoner
+        from modus.agent.strategies import PlanExecuteReasoner, ReActReasoner
 
-        factory = reasoner_factory or ReActReasoner
+        if reasoner_factory is None:
+            # ``config.prompt.agent_mode`` selects the default strategy.  The
+            # "react" mode is the classic loop; "plan" adds plan-then-execute
+            # decomposition.  Explicit reasoner_factory overrides both.
+            mode = str(getattr(getattr(self.config, "prompt", None), "agent_mode", "react"))
+            reasoner_factory = PlanExecuteReasoner if mode == "plan" else ReActReasoner
+        factory = reasoner_factory
         reasoner = factory(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,

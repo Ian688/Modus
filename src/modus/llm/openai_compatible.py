@@ -338,17 +338,11 @@ def _estimate_json_tokens(value: Any) -> int:
 
 
 def _estimate_message_tokens(message: Message) -> int:
-    """Token estimate for one Message (content + tool_calls)."""
-    total = 0
-    content = message.content
-    if isinstance(content, str):
-        total += len(content)
-    elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict):
-                total += len(str(part.get("text", "")))
-            else:
-                total += len(str(part))
-    for tc in message.tool_calls or []:
-        total += len(json.dumps(tc))
-    return total // 4
+    """Token estimate for one Message (content + tool_calls).
+
+    Delegates to the shared ``modus.agent.compressor.estimate_tokens`` so the
+    request-time trim and the end-of-run compaction agree on one estimator.
+    """
+    from modus.agent.compressor import estimate_tokens
+
+    return estimate_tokens([message])

@@ -759,3 +759,81 @@ def test_semantic_palette_maps_event_kinds_to_colors():
     assert ".approval-card { border:1px solid #e8a547" in css or ".approval-card" in css
     assert "color:var(--blue)" in css
     assert ".timeline-tool.artifact-details" in css
+
+
+@pytest.mark.asyncio
+async def test_kanban_board_command_returns_aggregation(tmp_path, monkeypatch):
+    from modus.desktop import db, server
+
+    monkeypatch.setattr(db, "DB_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "desktop.db")
+    db.init_db()
+    current = db.create_session("Kanban")
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, value):
+            self.sent.append(value)
+
+    socket = Socket()
+    session = server.DaoSession(id="runtime", db_id=current["id"])
+    await server.command_router.dispatch(socket, session, {
+        "type": "kanban_board", "session_id": current["id"],
+        "request_id": "kb-request",
+    })
+
+    packet = socket.sent[-1]
+    assert packet["type"] == "kanban_board"
+    assert packet["operation"] == "kanban_board"
+    assert packet["request_id"] == "kb-request"
+    assert packet["session_id"] == current["id"]
+    assert packet["board"]["schema"] == "modus.board-aggregation.v1"
+    assert packet["board"]["summary"]["total_runs"] == 0
+    # Every column key is present with a safe count.
+    assert set(packet["board"]["columns"]) == {
+        "todo", "analyzing", "executing", "verifying", "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_kanban_board_aggregates_existing_runs(tmp_path, monkeypatch):
+    from modus.desktop import db, server
+
+    monkeypatch.setattr(db, "DB_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "desktop.db")
+    db.init_db()
+    current = db.create_session("Kanban-2")
+    run = db.create_run("run-kb", current["id"], "default")
+    db.update_run(run["run_id"], state="completed", stop_reason="completed")
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, value):
+            self.sent.append(value)
+
+    socket = Socket()
+    session = server.DaoSession(id="runtime", db_id=current["id"])
+    await server.command_router.dispatch(socket, session, {
+        "type": "kanban_board", "session_id": current["id"],
+        "request_id": "kb-request-2",
+    })
+
+    board = socket.sent[-1]["board"]
+    assert board["summary"]["total_runs"] == 1
+    assert board["summary"]["completed"] == 1
+
+
+def test_kanban_board_attention_marker_is_declared():
+    """The board column header carries a human-attention badge."""
+    from _bundle import js_bundle
+
+    js = js_bundle()
+    kanban = (ROOT / "src/modus/desktop/static/kanban.js").read_text()
+
+    assert "columnAttentionCount" in kanban
+    assert "data-kb-attention" in kanban
+    assert 'type:"kanban_board"' not in js  # server command, not a client send
