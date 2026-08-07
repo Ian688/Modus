@@ -62,6 +62,22 @@ function summarizeToolResult(name, result, isError) {
       }
     } catch (_) {}
   }
+  if (name === "system_probe" && raw.startsWith("{")) {
+    try {
+      const snap = JSON.parse(raw);
+      if (snap.schema === "modus.system.v1") {
+        const cpu = snap.cpu || {};
+        const parts = [];
+        if (cpu.loadavg_1m != null) parts.push("负载 " + cpu.loadavg_1m);
+        if (cpu.cpu_count) parts.push(cpu.cpu_count + " 核");
+        const disk = (snap.disk || []).find(d => d.path === "/");
+        if (disk && disk.free_pct != null) parts.push("磁盘余 " + disk.free_pct + "%");
+        const procs = snap.processes || [];
+        parts.push(procs.length + " 进程");
+        return {summary: "系统快照 · " + parts.join(" · "), preview: raw, full: raw, truncated: false, lineCount: raw.split(/\r?\n/).length};
+      }
+    } catch (_) {}
+  }
   const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   const passed = raw.match(/(\d+)\s+passed\b/i);
   const failed = raw.match(/(\d+)\s+failed\b/i);
@@ -562,7 +578,8 @@ class TimelineRenderer {
       + '<span class="execution-receipt-state">' + escapeHtml(terminalLabel) + '</span>'
       + (receiptMeta ? '<span class="execution-receipt-meta">' + escapeHtml(receiptMeta) + '</span>' : '')
       + '<span class="execution-receipt-chevron" aria-hidden="true">›</span></summary>'
-      + '<div class="execution-receipt-body"><div class="execution-receipt-risk">风险级别 · ' + escapeHtml(payload.danger_level || "medium") + '</div>'
+      + '<div class="execution-receipt-body"><div class="execution-receipt-risk">风险级别 · ' + escapeHtml(payload.danger_level || "medium")
+      + (payload.impact_class ? '　影响 · ' + escapeHtml(payload.impact_class) : '') + '</div>'
       + '<p>' + escapeHtml(payload.description || "此操作可能产生副作用。") + '</p>'
       + inputHtml + resultHtml + '</div></details></section>';
   }

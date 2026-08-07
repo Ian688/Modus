@@ -86,6 +86,23 @@ class ToolExecutor:
                     is_error=True,
                 )
             data = tool.validate(payload)
+            # Deny-first capability gate.  This runs BEFORE approval: a tool
+            # class the run is not granted is refused outright, regardless of
+            # what a human might be asked next.  An explicit grant set is
+            # fail-closed — undeclared capabilities count as denied.
+            from modus.tools.capabilities import capabilities_granted
+
+            if not capabilities_granted(tool.capabilities, context.granted_capabilities):
+                missing = ", ".join(tool.capabilities or ["(undeclared)"])
+                return ToolResult(
+                    tool_use_id=tool_call_id,
+                    content=(
+                        f'Tool "{name}" denied: run is not granted capability '
+                        f"{missing}."
+                    ),
+                    is_error=True,
+                    metadata={"operation": "capability-denied"},
+                )
             decision = await self._approval_decision(tool, data, context, tool_call_id)
             if decision.is_denied:
                 return ToolResult(tool_use_id=tool_call_id, content=decision.error, is_error=True)
@@ -193,6 +210,12 @@ class ToolExecutor:
             "danger_level": tool.danger_level,
             "requires_approval": tool.requires_approval,
             "data_disclosure": tool.data_disclosure,
+            # Impact classification for the approval surface: a read-only tool is
+            # a pure probe (no side effect), a mutating tool changes workspace
+            # state, and a not_read_only-but-low-trust tool (e.g. a remote MCP
+            # tool) is undetermined until its handler runs.  This is advisory UI
+            # context for the human reviewer; enforcement stays in the guards.
+            "impact_class": _impact_class(tool),
         }
         try:
             response = context.approval_callback(request)
@@ -275,6 +298,17 @@ class _ApprovalDecision:
     @property
     def is_skipped(self) -> bool:
         return self.skip
+
+
+def _impact_class(tool: Tool) -> str:
+    """Classify a tool's expected side effects for the approval surface.
+
+    ``read-only`` is a pure probe with no workspace side effect; anything else
+    is ``mutating`` (writes, execution, credential changes).  This is
+    human-review context only — the capability gate, CommandGuard and PathGuard
+    remain the actual enforcement.
+    """
+    return "read-only" if tool.is_read_only else "mutating"
 
 
 def _canonical_hash(payload: dict[str, Any]) -> str:

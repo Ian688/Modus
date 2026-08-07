@@ -1708,6 +1708,7 @@ class ApprovalE2EFixtureEngine:
                 is_read_only=False,
                 danger_level="high",
                 requires_approval=True,
+                capabilities=("filesystem",),
             )
         )
 
@@ -1779,6 +1780,11 @@ def start_server(
 ) -> None:
     """Start the Modus Desktop WebSocket and static-file service."""
     global _desktop_default_workspace_root
+    # A normal close (service stop / Ctrl-C / SIGTERM) reaps background
+    # processes this Desktop session spawned.
+    from modus.process_cleanup import install_process_cleanup
+
+    install_process_cleanup()
     _desktop_default_workspace_root = (
         WorkspaceIdentity.from_path(workspace_root).root
         if workspace_root is not None else None
@@ -2614,6 +2620,85 @@ async def _send_duplicate_run_admission(
         "owned": owner is not None,
         "run_owned_by_connection": owner is session,
     })
+
+
+async def _handle_browser_comment(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Accept a browser element-annotation comment and forward it as a run turn.
+
+    The frontend picks elements in the preview iframe (annotate.js) and posts
+    ``{type:"browser_comment", url, items:[{selector,tag,text,annotation,rect}]}``.
+    This validates the payload (bounded, loopback-only URL) then delegates to the
+    normal ``run_message`` admission pipeline, so the comment reaches the LLM as
+    the next user turn with all existing fingerprint/approval machinery intact.
+    """
+    import json as _json
+
+    async def _reject(code: str, text: str) -> None:
+        # Best-effort: reuse the transport's error envelope shape.
+        try:
+            await websocket.send_json({
+                "type": "error", "code": code, "message": text,
+                "operation": "browser_comment",
+                "request_id": str(message.get("request_id") or "")[:128],
+            })
+        except Exception:
+            pass
+
+    items = message.get("items")
+    if not isinstance(items, list) or not items:
+        await _reject("invalid_browser_comment", "browser_comment 需要至少一个元素。")
+        return
+    if len(items) > 20:
+        await _reject("invalid_browser_comment", "browser_comment 最多 20 个元素。")
+        return
+    url = str(message.get("url") or "").strip()
+    if not url:
+        await _reject("invalid_browser_comment", "browser_comment 需要 url。")
+        return
+    try:
+        _require_loopback_preview(url)
+    except ValueError:
+        await _reject("invalid_browser_comment", "browser_comment url 必须指向 localhost。")
+        return
+
+    lines = ["[浏览器元素点评]", f"页面: {url}"]
+    for i, item in enumerate(items[:20], start=1):
+        if not isinstance(item, dict):
+            continue
+        selector = str(item.get("selector") or "")[:300]
+        text = str(item.get("text") or "")[:200]
+        annotation = str(item.get("annotation") or "")[:2000]
+        lines.append(f"{i}. <{selector}> \"{text}\"：{annotation or '(无点评)'}")
+    content = "\n".join(lines)
+
+    # Forward through the normal run_message admission pipeline.
+    # Carry element screenshots as image attachments so the LLM sees the actual
+    # UI the user commented on.  The same data-URI whitelist the composer uses
+    # applies (data:image/png|jpeg|webp;base64).
+    image_items = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("image") or "").startswith(("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,"))
+    ]
+    attachments = [
+        {"kind": "image", "content": str(item["image"])}
+        for item in image_items[:4]
+    ]
+
+    run_msg = {
+        "type": "run_message",
+        "content": content,
+        "request_id": str(message.get("request_id") or ""),
+        "db_id": str(message.get("db_id") or ""),
+        "session_id": str(message.get("session_id") or ""),
+        "runtime_session_id": str(message.get("runtime_session_id") or ""),
+    }
+    if attachments:
+        run_msg["attachments"] = attachments
+    await _handle_explicit_run_message(websocket, session, run_msg)
+
 
 
 async def _handle_explicit_run_message(
@@ -3707,6 +3792,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     )
             elif msg_type == "run_message":
                 await _handle_explicit_run_message(websocket, session, msg)
+            elif msg_type == "browser_comment":
+                await _handle_browser_comment(websocket, session, msg)
             elif msg_type == "cancel":
                 session.cancel_stream()
                 await websocket.send_json({

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+
 class FailoverReason(Enum):
     """API 调用失败的原因 —— 决定恢复策略"""
     auth = "auth"
@@ -18,6 +19,7 @@ class FailoverReason(Enum):
     format_error = "format_error"
     unknown = "unknown"
 
+
 @dataclass
 class ClassifiedError:
     """错误分类结果，附带恢复建议"""
@@ -25,6 +27,34 @@ class ClassifiedError:
     retryable: bool
     message: str = ""
     status_code: int = 0
+
+
+# The recovery action a run takes for a classified provider failure.  Kept a
+# plain enum so the mapping is data, not control flow.
+class RecoveryAction(Enum):
+    RETRY_WITH_BACKOFF = "retry_with_backoff"          # transient: sleep, retry once
+    FORCE_COMPACT_AND_RETRY = "force_compact_and_retry"  # context too long: compact, retry once
+    SURFACE_TYPED = "surface_typed"                    # terminal, typed reason (auth/billing/model)
+    FAIL_CLOSED = "fail_closed"                        # unknown or unsafe: engine_error
+
+
+def recovery_policy(reason: FailoverReason) -> RecoveryAction:
+    """Map one classified failure reason to exactly one recovery action.
+
+    The default branch is FAIL_CLOSED so a misclassification degrades to the
+    safe terminal path instead of an unbounded retry.  Every action is bounded:
+    retries are single-shot and budget-aware in the caller.
+    """
+    if reason in {FailoverReason.rate_limit, FailoverReason.overloaded,
+                  FailoverReason.server_error, FailoverReason.timeout}:
+        return RecoveryAction.RETRY_WITH_BACKOFF
+    if reason is FailoverReason.context_overflow:
+        return RecoveryAction.FORCE_COMPACT_AND_RETRY
+    if reason in {FailoverReason.auth, FailoverReason.auth_permanent,
+                  FailoverReason.billing, FailoverReason.model_not_found}:
+        return RecoveryAction.SURFACE_TYPED
+    return RecoveryAction.FAIL_CLOSED
+
 
 def classify_api_error(error: Exception, status_code: int = 0) -> ClassifiedError:
     """根据异常类型和 HTTP 状态码分类 API 错误"""

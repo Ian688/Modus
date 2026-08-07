@@ -90,18 +90,22 @@ def create_snapshot(
         message = f"{phase}"
         if summary:
             message += f"\n\n{summary}"
-        stdout, stderr, code = _git(root, "commit", "--allow-empty", "-m", message)
+        _stdout, stderr, code = _git(root, "commit", "--allow-empty", "-m", message)
         if code != 0:
             # A commit may fail if git has no configured identity; set a local
             # fallback identity and retry once.
             _git(root, "config", "user.name", "Modus Snapshot")
             _git(root, "config", "user.email", "snapshot@modus.local")
-            stdout, stderr, code = _git(root, "commit", "--allow-empty", "-m", message)
+            _stdout, stderr, code = _git(root, "commit", "--allow-empty", "-m", message)
             if code != 0:
                 return None
-        commit_id = stdout.strip() if stdout.strip() else ""
+        # ``git commit`` prints a human-readable summary, not the hash.  The
+        # stable id is HEAD; resolve it explicitly so ``revert_turn`` can
+        # restore the exact snapshot.
+        commit_stdout, commit_stderr, rev_code = _git(root, "rev-parse", "HEAD")
+        commit_id = commit_stdout.strip() if rev_code == 0 else ""
         if not commit_id:
-            _, _, _ = _git(root, "rev-parse", "HEAD")
+            return None
         return Snapshot(commit_id=commit_id, phase=phase, summary=summary)
     except Exception:
         return None

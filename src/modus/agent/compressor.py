@@ -45,7 +45,14 @@ def compress_messages(
     summary: str = "",
     tail_count: int = 4,
 ) -> list[Message]:
-    """压缩中间轮次，保护头尾上下文"""
+    """压缩中间轮次，保护头尾上下文。
+
+    Keeps an original system contract (if any), a reference-only summary, the
+    final user instruction, and a turn-aligned recent tail.  ``tail`` never
+    starts mid-tool-turn: if it would begin on a ``tool`` message whose owning
+    assistant was compacted, it backs up to that assistant so every retained
+    tool message has its assistant tool_call in the retained context.
+    """
     if len(messages) <= tail_count + 2:
         return messages
 
@@ -70,4 +77,33 @@ def compress_messages(
         else []
     )
     tail = messages[-tail_count:]
+
+    # Turn-align the tail: back up so the tail starts at an assistant-with-
+    # tool_calls (or any non-tool) message, never in the middle of a
+    # compacted tool turn.  Every retained tool message then has its owning
+    # assistant tool_call present.
+    start = 0
+    for index, message in enumerate(tail):
+        if message.role != "tool":
+            start = index
+            break
+    if start > 0:
+        tail = tail[start:]
+
+    # Never drop the final user instruction: if the last user message falls
+    # outside the tail, splice it back in right before the tail.
+    last_user_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].role == "user":
+            last_user_index = index
+            break
+    if last_user_index >= 0:
+        # The user message is present in the tail already when its index is at
+        # or after ``len(messages) - len(tail)``.
+        tail_start_index = len(messages) - len(tail)
+        if last_user_index < tail_start_index:
+            kept_user = messages[last_user_index]
+            if kept_user not in tail:
+                tail = [kept_user, *tail]
+
     return head + [summary_msg] + tail

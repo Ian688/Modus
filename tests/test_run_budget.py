@@ -99,3 +99,65 @@ async def test_provider_error_is_not_reported_as_done():
 
     assert [event["type"] for event in events] == ["error"]
     assert events[0]["stop_reason"] == "engine_error"
+
+
+def test_turn_records_accumulate_and_stall_detection():
+    budget = RunBudget()
+    budget.record_turn(turn=1, text_chars=10, tool_successes=1)
+    budget.record_turn(turn=2, text_chars=0, tool_successes=0, tool_errors=1)
+    budget.record_turn(turn=3, text_chars=0, tool_successes=0, tool_errors=1)
+    budget.record_turn(turn=4, text_chars=0, tool_successes=0, tool_errors=1)
+
+    assert len(budget.turn_records) == 4
+    assert budget.turn_records[0].made_progress() is True
+    assert budget.turn_records[1].made_progress() is False
+    # Threshold of 3: the last 3 records (2,3,4) are all no-progress -> stalled.
+    assert budget.stalled_for(3) is True
+    # Threshold of 4: the last 4 include record 1 (progress) -> not stalled.
+    assert budget.stalled_for(4) is False
+
+
+def test_stall_detection_clears_on_progress():
+    budget = RunBudget()
+    budget.record_turn(turn=1, text_chars=0, tool_errors=1)
+    budget.record_turn(turn=2, text_chars=0, tool_errors=1)
+    budget.record_turn(turn=3, text_chars=5)  # progress resets the window
+    budget.record_turn(turn=4, text_chars=0, tool_errors=1)
+
+    assert budget.stalled_for(3) is False
+
+
+def test_turn_records_are_bounded():
+    budget = RunBudget()
+    for index in range(250):
+        budget.record_turn(turn=index + 1, text_chars=0)
+    assert len(budget.turn_records) <= 200
+    # Newest records survive.
+    assert budget.turn_records[-1].turn == 250
+
+
+def test_no_progress_stop_reason_enum():
+    from modus.runtime.budget import StopReason
+    assert StopReason.NO_PROGRESS.value == "no_progress"
+
+
+def test_trends_summarizes_turn_records():
+    budget = RunBudget()
+    budget.record_turn(turn=1, tool_calls=2, tool_errors=2, text_chars=0)  # hotspot
+    budget.record_turn(turn=2, tool_calls=1, tool_errors=1, text_chars=0)  # hotspot
+    budget.record_turn(turn=3, tool_calls=1, tool_successes=1, text_chars=5)  # progress
+
+    trends = budget.trends(window=5)
+    assert trends["tool_error_hotspot"] is True
+    assert trends["tool_error_rate"] > 0
+    assert trends["consecutive_no_progress"] == 0  # last turn made progress
+
+
+def test_trends_clean_window_has_no_hotspot():
+    budget = RunBudget()
+    budget.record_turn(turn=1, tool_successes=1, text_chars=10)
+    budget.record_turn(turn=2, tool_successes=2, text_chars=5)
+
+    trends = budget.trends(window=5)
+    assert trends["tool_error_hotspot"] is False
+    assert trends["tool_error_rate"] == 0.0

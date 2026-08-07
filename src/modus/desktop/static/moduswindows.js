@@ -54,18 +54,163 @@
     if (!/^https?:\/\/localhost:\d+/i.test(target)) return;
     currentPreviewUrl = target;
     const frame = document.getElementById("kbPreviewFrame");
+    const section = document.getElementById("kbPreviewSection");
     if (frame) {
       // Route through the same-origin proxy so iframe loads never hit CORS.
       frame.src = "/api/preview?url=" + encodeURIComponent(target);
       frame.hidden = false;
     }
+    if (section) section.hidden = false;
+    const drawer = document.getElementById("kbDrawer");
+    if (drawer && drawer.hidden) drawer.hidden = false;
   }
   function previewFromEvent(event) {
     if (event.type !== "tool_result") return;
+    const metadata = event.payload?.metadata || {};
+    // Explicit contract: browser_navigate sets metadata.preview_url.  This is
+    // the authoritative signal; the regex scan is only a fallback for older
+    // tools that printed a localhost URL in their result text.
+    if (metadata.preview_url && /^https?:\/\/localhost:\d+/i.test(metadata.preview_url)) {
+      loadPreview(metadata.preview_url);
+      return;
+    }
     const result = String(event.payload?.result || event.payload?.output || "");
     const display = String(event.payload?.display_summary || "");
     const match = (result + "\n" + display).match(LOCALHOST_RE);
     if (match) loadPreview(match[0]);
+  }
+
+  // ─── Element annotation (Phase A2): human picks elements + comments ───
+  // The preview iframe is same-origin (/api/preview), so the parent can inject
+  // annotate.js into its contentDocument and drive it via postMessage.  The
+  // selectors it produces are the cross-surface contract with the Agent's
+  // headless browser.
+  let annotationMode = false;
+  let pendingAnnotations = [];
+
+  function injectAnnotate(frame) {
+    try {
+      const doc = frame.contentDocument;
+      if (!doc || doc.__MODUS_ANNOTATE_INJECTED__) return;
+      const s = doc.createElement("script");
+      s.src = "/static/annotate.js";
+      // annotate.js sets __MODUS_ANNOTATE_INJECTED__ on itself; this onload
+      // merely backstops the case where the script is cached but skipped.
+      s.onload = () => {
+        if (!doc.__MODUS_ANNOTATE_INJECTED__) {
+          // Script may have failed silently; retry once via direct eval.
+          try {
+            const src = fetch(s.src).then(r => r.text()).then(t => {
+              if (!doc.__MODUS_ANNOTATE_INJECTED__) doc.defaultView.eval(t);
+            });
+          } catch (_) {}
+        }
+      };
+      doc.body.appendChild(s);
+    } catch (_) { /* non-HTML or not ready */ }
+  }
+
+  function toggleAnnotation() {
+    const frame = document.getElementById("kbPreviewFrame");
+    const btn = document.getElementById("kbAnnotateBtn");
+    const bar = document.getElementById("kbAnnotationBar");
+    if (!frame || !frame.contentWindow) return;
+    annotationMode = !annotationMode;
+    if (btn) btn.classList.toggle("active", annotationMode);
+    if (annotationMode) {
+      injectAnnotate(frame);
+      if (bar) bar.hidden = false;
+      // The injected script loads asynchronously; poll until its state object
+      // is live, then send annotate.on.  A ready postMessage is not reliable
+      // for the first inject (the parent listener may not be bound yet).
+      let attempts = 0;
+      (function waitReady() {
+        const win = frame.contentWindow;
+        if (annotationMode && win && win.__MODUS_ANNOTATE__) {
+          win.postMessage({ cmd: "annotate.on" }, "*");
+          return;
+        }
+        if (attempts++ < 40) setTimeout(waitReady, 100);
+      })();
+    } else {
+      frame.contentWindow.postMessage({ cmd: "annotate.off" }, "*");
+      if (bar) bar.hidden = true;
+      pendingAnnotations = [];
+      updateAnnotationBar();
+    }
+  }
+
+  function updateAnnotationBar() {
+    const bar = document.getElementById("kbAnnotationBar");
+    const count = document.getElementById("kbAnnotationCount");
+    const send = document.getElementById("kbAnnotationSend");
+    const clear = document.getElementById("kbAnnotationClear");
+    if (count) count.textContent = pendingAnnotations.length + " 个元素";
+    if (send) send.disabled = pendingAnnotations.length === 0;
+    if (clear && pendingAnnotations.length === 0) clear.disabled = true;
+    else if (clear) clear.disabled = false;
+  }
+
+  function submitAnnotations() {
+    if (!pendingAnnotations.length) return;
+    const url = currentPreviewUrl;
+    const content = "[浏览器元素点评]\n页面: " + (url || "") + "\n" + pendingAnnotations.map((it, i) =>
+      "- <" + (it.selector || "") + "> \"" + (it.text || "") + "\"：" + (it.annotation || "(无点评)")
+    ).join("\n");
+    // Carry element screenshots as image attachments (data: URI), matching the
+    // image attachment kind the composer already accepts.
+    const attachments = pendingAnnotations
+      .filter(it => it.image && /^data:image\//.test(String(it.image)))
+      .map(it => ({ kind: "image", content: it.image }));
+    if (typeof window.sendUserEditedMessage === "function") {
+      window.sendUserEditedMessage(content, "", attachments);
+    }
+    // Reset the annotation state after sending.
+    const frame = document.getElementById("kbPreviewFrame");
+    if (frame && frame.contentWindow) {
+      frame.contentWindow.postMessage({ cmd: "annotate.off" }, "*");
+    }
+    pendingAnnotations = [];
+    annotationMode = false;
+    const btn = document.getElementById("kbAnnotateBtn");
+    if (btn) btn.classList.remove("active");
+    const bar = document.getElementById("kbAnnotationBar");
+    if (bar) bar.hidden = true;
+    updateAnnotationBar();
+  }
+
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || typeof msg !== "object" || msg.source !== "modus-annotate") return;
+    if (msg.type === "modus-annotate:submit") {
+      pendingAnnotations = Array.isArray(msg.items) ? msg.items : [];
+      updateAnnotationBar();
+    } else if (msg.type === "modus-annotate:ready") {
+      // The injected script is live; start pick mode if annotation is toggled on.
+      const frame = document.getElementById("kbPreviewFrame");
+      if (frame && frame.contentWindow && annotationMode) {
+        frame.contentWindow.postMessage({ cmd: "annotate.on" }, "*");
+      }
+    }
+  });
+
+  function setupAnnotationControls() {
+    const btn = document.getElementById("kbAnnotateBtn");
+    if (btn) btn.addEventListener("click", toggleAnnotation);
+    const send = document.getElementById("kbAnnotationSend");
+    if (send) send.addEventListener("click", submitAnnotations);
+    const clear = document.getElementById("kbAnnotationClear");
+    if (clear) clear.addEventListener("click", () => {
+      pendingAnnotations = [];
+      const frame = document.getElementById("kbPreviewFrame");
+      if (frame && frame.contentWindow) frame.contentWindow.postMessage({ cmd: "annotate.clear" }, "*");
+      updateAnnotationBar();
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", setupAnnotationControls);
+  } else {
+    setupAnnotationControls();
   }
 
   // ─── Activity cards (folded into the KANBAN run card) ───

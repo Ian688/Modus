@@ -148,3 +148,183 @@ async def test_agent_mode_plan_selects_plan_execute_reasoner():
     types = [ev["type"] for ev in events]
     assert "plan" in types
     assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_plan_execute_runs_parallel_tasks_concurrently():
+    """Parallelizable tasks run concurrently (wall-clock < serial sum)."""
+    import time
+    from modus.agent.planning import ExecutionPlan, PlanTask
+
+    PlanClient.calls = 0
+
+    class SlowClient(PlanClient):
+        async def chat(self, messages, tools, *, system_prompt):
+            PlanClient.calls += 1
+            if PlanClient.calls == 1:
+                yield {"type": "text_delta", "text": (
+                    '{"summary": "p", "tasks": ['
+                    '{"id": "a", "description": "read a", "type": "file_read", "dependencies": []},'
+                    '{"id": "b", "description": "read b", "type": "file_read", "dependencies": []}'
+                    ']}'
+                )}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            await asyncio.sleep(0.2)  # each task's inner model call sleeps
+            yield {"type": "text_delta", "text": f"done {PlanClient.calls}"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = PlanExecuteReasoner(
+        llm_client=SlowClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    start = time.monotonic()
+    events = [ev async for ev in reasoner.run(
+        [Message(role="user", content="do both")],
+    )]
+    elapsed = time.monotonic() - start
+
+    # Two 0.2s tasks running concurrently finish well under 0.4s.
+    assert elapsed < 0.38
+    assert events[-1]["type"] == "done"
+    assert events[-1]["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_plan_execute_replans_on_failure():
+    """A failed task triggers one plan_replan, then the revised plan succeeds."""
+    PlanClient.calls = 0
+
+    class ReplanClient(PlanClient):
+        async def chat(self, messages, tools, *, system_prompt):
+            PlanClient.calls += 1
+            if PlanClient.calls == 1:
+                # Initial plan: task_a fails, task_b depends on it.
+                yield {"type": "text_delta", "text": (
+                    '{"summary": "r", "tasks": ['
+                    '{"id": "a", "description": "fail this", "type": "file_read", "dependencies": []},'
+                    '{"id": "b", "description": "after a", "type": "analysis", "dependencies": ["a"]}'
+                    ']}'
+                )}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            if PlanClient.calls == 2:
+                # Task a fails with a terminal error.
+                yield {"type": "error", "error": "API 401: bad key"}
+                return
+            if PlanClient.calls == 3:
+                # Replan call: new single task.
+                yield {"type": "text_delta", "text": (
+                    '{"summary": "r2", "tasks": ['
+                    '{"id": "c", "description": "revised plan", "type": "analysis", "dependencies": []}'
+                    ']}'
+                )}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            yield {"type": "text_delta", "text": "revised done"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = PlanExecuteReasoner(
+        llm_client=ReplanClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="go")])]
+
+    types = [ev["type"] for ev in events]
+    assert "plan_replan" in types
+    done = events[-1]
+    assert done["type"] == "done"
+    # The revised plan completed.
+    assert done["stop_reason"] == "completed"
+    texts = "".join(ev.get("text", "") for ev in events if ev["type"] == "text_delta")
+    assert "revised done" in texts
+
+
+def test_select_reasoner_heuristic():
+    from modus.agent.strategies import PlanExecuteReasoner, ReActReasoner
+    from modus.agent.strategies.select import select_reasoner
+    from modus.config import ModusConfig
+
+    cfg = ModusConfig()  # agent_mode defaults to "react"
+
+    # Conversational stays on ReAct.
+    assert select_reasoner("你好", [], cfg) is ReActReasoner
+    # Multi-step + file intent -> PlanExecute.
+    assert select_reasoner("先读缓存代码，然后重构实现", [], cfg) is PlanExecuteReasoner
+    # Explicit factory wins.
+    class Custom: pass
+    assert select_reasoner("hi", [], cfg, explicit_factory=Custom) is Custom
+
+
+def test_select_reasoner_agent_mode_plan_pins_plan():
+    from modus.agent.strategies import PlanExecuteReasoner
+    from modus.agent.strategies.select import select_reasoner
+    from modus.config import ModusConfig
+
+    cfg = ModusConfig()
+    cfg.prompt.agent_mode = "plan"
+
+    # Even a conversational request goes to PlanExecute when pinned.
+    assert select_reasoner("你好", [], cfg) is PlanExecuteReasoner
+
+
+@pytest.mark.asyncio
+async def test_done_messages_include_task_history():
+    """done.messages must reflect the accumulated task context, not a pre-run snapshot."""
+    PlanClient.calls = 0
+
+    reasoner = PlanExecuteReasoner(
+        llm_client=PlanClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run(
+        [Message(role="user", content="重构缓存层")],
+    )]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    messages = done["messages"]
+    # The task outputs were produced; done.messages must contain more than the
+    # pre-run snapshot (which was just the user request).
+    assert any("task output" in str(m.content) for m in messages if m.role == "assistant")
+
+
+@pytest.mark.asyncio
+async def test_agent_selects_reasoner_from_current_message():
+    """Reasoner selection must use the CURRENT request, not the previous turn."""
+    from modus.agent.query_engine import QueryEngine
+
+    PlanClient.calls = 0
+
+    class RecordingClient(PlanClient):
+        async def chat(self, messages, tools, *, system_prompt):
+            PlanClient.calls += 1
+            # Planner calls pass no tools; always return a plan JSON there.
+            if not tools:
+                yield {"type": "text_delta", "text": (
+                    '{"summary": "s", "tasks": [{"id": "t1", "description": "one", "type": "analysis"}]}'
+                )}
+                yield {"type": "message_end", "stop_reason": "end_turn"}
+                return
+            yield {"type": "text_delta", "text": "done"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    cfg = ModusConfig()
+    engine = QueryEngine(
+        llm_client=RecordingClient(), tool_registry=_registry(), config=cfg, cwd="/tmp",
+    )
+    # First turn: conversational "hi" -> ReAct (no plan event).
+    events1 = [ev async for ev in engine.ask("hi")]
+    assert "plan" not in [ev["type"] for ev in events1]
+
+    # Second turn: multi-step file request -> must select PlanExecute despite
+    # the history containing the previous "hi".
+    PlanClient.calls = 0
+    engine2 = QueryEngine(
+        llm_client=RecordingClient(), tool_registry=_registry(), config=cfg, cwd="/tmp",
+    )
+    async for ev in engine2.ask("hi"):
+        pass
+    events2 = [ev async for ev in engine2.ask("先重构文件，再创建测试")]
+
+    assert "plan" in [ev["type"] for ev in events2]

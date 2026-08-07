@@ -463,3 +463,121 @@ async def test_spawn_subtask_available_when_recursion_enabled():
     assert "tool_call" in types
     # The parent then sees the child's text result in a tool_result.
     assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_failing_tool_probes_do_not_count_as_stall():
+    """Repeated failing tool probes are investigative activity, not stall."""
+    from modus.config import RuntimeConfig
+    from modus.agent.strategies import ReActReasoner
+
+    cfg = ModusConfig()
+    cfg.runtime = RuntimeConfig(no_progress_threshold=3)
+
+    class ProbeClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            # Emits a tool call each turn (even though it fails) and no text.
+            yield {
+                "type": "tool_call_delta", "tool_call": {
+                    "index": 0, "id": f"p{len(messages)}",
+                    "function": {"name": "echo", "arguments": '{"text":"x"}'},
+                },
+            }
+            yield {"type": "message_end", "stop_reason": "tool_use"}
+
+    async def failing_handler(_payload, _ctx):
+        return ToolResult("boom", is_error=True)
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="echo", description="echo", handler=failing_handler,
+        parameters=object_schema({"text": {"type": "string"}}, ["text"]),
+        required_keys=["text"],
+    ))
+    reasoner = ReActReasoner(
+        llm_client=ProbeClient(), tool_registry=registry,
+        system_prompt="sys", cwd="/tmp", config=cfg, max_turns=6,
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="go")])]
+
+    done = events[-1]
+    # The failing probes are activity: the run burns max_turns, not NO_PROGRESS.
+    assert done["stop_reason"] != "no_progress"
+
+
+@pytest.mark.asyncio
+async def test_turn_records_in_budget_snapshot():
+    """done carries per-turn self-observation records for debugging."""
+    from modus.agent.strategies import ReActReasoner
+
+    reasoner = ReActReasoner(
+        llm_client=FakeClient(tool_turn=True), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="hi")])]
+
+    records = events[-1]["budget"]["turn_records"]
+    assert records, "turn_records should be present in the done budget snapshot"
+    # The tool round-trip turn attempted a tool call (activity).
+    assert any(r["tool_calls"] > 0 for r in records)
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_self_heals_by_compacting():
+    """A context-overflow error with zero output compacts and retries once."""
+    from modus.agent.strategies import ReActReasoner
+
+    class OverflowThenOkClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+        calls = 0
+
+        async def chat(self, messages, tools, *, system_prompt):
+            OverflowThenOkClient.calls += 1
+            if OverflowThenOkClient.calls == 1:
+                yield {"type": "error", "error": "API 413: context length exceeded"}
+                return
+            yield {"type": "text_delta", "text": "recovered after compact"}
+            yield {"type": "message_end", "stop_reason": "end_turn"}
+
+    reasoner = ReActReasoner(
+        llm_client=OverflowThenOkClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="hi")])]
+
+    assert OverflowThenOkClient.calls == 2  # retried once
+    assert events[-1]["type"] == "done"
+    assert events[-1]["stop_reason"] == "completed"
+    texts = "".join(ev.get("text", "") for ev in events if ev["type"] == "text_delta")
+    assert "recovered after compact" in texts
+
+
+@pytest.mark.asyncio
+async def test_auth_error_is_terminal_with_failover_reason():
+    """An auth error ends the run immediately with a typed failover reason."""
+    from modus.agent.strategies import ReActReasoner
+
+    class AuthClient:
+        model_name = "fake"
+        provider_name = "test"
+        max_context_window = 128_000
+
+        async def chat(self, messages, tools, *, system_prompt):
+            yield {"type": "error", "error": "API 401: invalid api key"}
+            return
+
+    reasoner = ReActReasoner(
+        llm_client=AuthClient(), tool_registry=_registry(),
+        system_prompt="sys", cwd="/tmp", config=ModusConfig(),
+    )
+    events = [ev async for ev in reasoner.run([Message(role="user", content="hi")])]
+
+    error = next(ev for ev in events if ev["type"] == "error")
+    assert error["failover"] == "auth"
+    assert error["stop_reason"] == "engine_error"

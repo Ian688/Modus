@@ -37,6 +37,9 @@ class ToolsConfig:
     # Tool results longer than this are persisted as local artifacts and the
     # model receives a bounded head/tail payload instead of raw full text.
     tool_result_artifact_chars: int = 20_000
+    # Hard cap on files a recursive scan (grep/search_code/glob) will walk.
+    # Overrides the builtin default so large source trees are fully searchable.
+    max_scan_files: int = 20_000
 
 @dataclass(slots=True)  #长期记忆的开关和存储位置
 class MemoryConfig:
@@ -57,6 +60,11 @@ class PolicyConfig:
     path_guard_enabled: bool = True
     command_blacklist: list[str] = field(default_factory=_default_blacklist)
     audit_log_path: str = field(default_factory=lambda: str(data_path("audit.jsonl")))
+    # Active capability grant for a run.  ``None`` (the default) grants every
+    # declared capability — unrestricted, unchanged behavior.  An explicit list
+    # (e.g. ["filesystem"] for a read-only lens) makes the executor deny every
+    # tool whose declared capability is outside the set, before approval.
+    capability_grant: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -89,7 +97,7 @@ class CompressionConfig:
     # When true, compaction asks the configured LLM to produce a real summary
     # of the omitted middle turns instead of a generic count message.  Falls
     # back to the count message when the model call fails or no API key is set.
-    semantic: bool = False
+    semantic: bool = True
     # Cap for the omitted-message text sent to the summarizer, in characters.
     semantic_input_chars: int = 24_000
 
@@ -113,6 +121,9 @@ class RuntimeConfig:
     max_tokens: int = 200_000
     max_wall_seconds: float = 600.0
     max_verification_attempts: int = 3
+    # Self-aware stall detection: stop when this many consecutive turns made
+    # no progress (no text, no successful tool). 0 disables the check.
+    no_progress_threshold: int = 4
 
 @dataclass(slots=True)
 class FeatureConfig:
@@ -127,6 +138,10 @@ class FeatureConfig:
     billing: bool = False
     # ast-based diagnostics injected after editing Python files.
     lsp_diagnostics: bool = True
+    # Self-adaptive loop: the reasoner reads turn_records trends and injects
+    # bounded corrective hints (e.g. a repeated tool-error hotspot).  Off by
+    # default so existing run behavior is unchanged.
+    self_adapt: bool = False
 
 @dataclass(slots=True)
 class ModusConfig:
@@ -278,6 +293,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("PARK_ON_DISCONNECT", "features.park_on_disconnect", lambda v: v.lower() == "true"),
         ("BILLING", "features.billing", lambda v: v.lower() == "true"),
         ("LSP_DIAGNOSTICS", "features.lsp_diagnostics", lambda v: v.lower() == "true"),
+        ("SELF_ADAPT", "features.self_adapt", lambda v: v.lower() == "true"),
         ("CONVERGENCE_ENABLED", "features.convergence.enabled", lambda v: v.lower() == "true"),
         ("MAX_REVISION_ROUNDS", "features.convergence.max_revision_rounds", int),
         ("CONVERGENCE_SEMANTIC_THRESHOLD", "features.convergence.semantic_threshold", float),
@@ -290,6 +306,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("TOOLS_BATCH_TIMEOUT", "tools.batch_timeout", float),
         ("TOOLS_MAX_CONCURRENT_READ", "tools.max_concurrent_read", int),
         ("TOOLS_TOOL_RESULT_ARTIFACT_CHARS", "tools.tool_result_artifact_chars", int),
+        ("TOOLS_MAX_SCAN_FILES", "tools.max_scan_files", int),
         ("MEMORY_MAX_CONVERSATION_HISTORY", "memory.max_conversation_history", int),
         ("MEMORY_AUTO_MEMORIZE", "memory.auto_memorize", lambda v: v.lower() == "true"),
         ("MEMORY_RETRIEVAL_ENABLED", "memory.retrieval_enabled", lambda v: v.lower() == "true"),
@@ -298,6 +315,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("POLICY_PATH_GUARD_ENABLED", "policy.path_guard_enabled", lambda v: v.lower() == "true"),
         ("POLICY_COMMAND_BLACKLIST", "policy.command_blacklist", lambda v: v.split(",") if v else []),
         ("POLICY_AUDIT_LOG_PATH", "policy.audit_log_path", str),
+        ("POLICY_CAPABILITY_GRANT", "policy.capability_grant", lambda v: v.split(",") if v else None),
         ("SANDBOX_ENABLED", "sandbox.enabled", lambda v: v.lower() == "true"),
         ("SANDBOX_CPU_SECONDS", "sandbox.cpu_seconds", int),
         ("SANDBOX_FSIZE_BYTES", "sandbox.fsize_bytes", int),
@@ -306,6 +324,7 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("RUN_MAX_TOKENS", "runtime.max_tokens", int),
         ("RUN_MAX_WALL_SECONDS", "runtime.max_wall_seconds", float),
         ("RUN_MAX_VERIFICATION_ATTEMPTS", "runtime.max_verification_attempts", int),
+        ("RUN_NO_PROGRESS_THRESHOLD", "runtime.no_progress_threshold", int),
     ]
 
     for suffix, config_path, caster in mappings:

@@ -39,14 +39,24 @@ class Agent:
         run_id: str | None = None,
         reasoner_factory: Callable[..., Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        from modus.agent.strategies import PlanExecuteReasoner, ReActReasoner
+        from modus.agent.strategies import ReActReasoner
+        from modus.agent.strategies.select import select_reasoner
 
         if reasoner_factory is None:
-            # ``config.prompt.agent_mode`` selects the default strategy.  The
-            # "react" mode is the classic loop; "plan" adds plan-then-execute
-            # decomposition.  Explicit reasoner_factory overrides both.
-            mode = str(getattr(getattr(self.config, "prompt", None), "agent_mode", "react"))
-            reasoner_factory = PlanExecuteReasoner if mode == "plan" else ReActReasoner
+            # Deterministic strategy selection: ``config.prompt.agent_mode``
+            # pins a default; otherwise the request shape picks ReAct vs
+            # PlanExecute.  Explicit reasoner_factory overrides all.
+            # Select from the CURRENT request first; fall back to the last
+            # history user message only when the current one is empty.
+            latest = str(message or "")
+            if not latest:
+                for m in reversed(self.history or []):
+                    if m.role == "user" and isinstance(m.content, str) and m.content:
+                        latest = m.content
+                        break
+            reasoner_factory = select_reasoner(
+                latest, self.history, self.config,
+            ) or ReActReasoner
         factory = reasoner_factory
         reasoner = factory(
             llm_client=self.llm_client,

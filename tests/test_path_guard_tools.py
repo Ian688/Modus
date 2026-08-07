@@ -4,7 +4,9 @@ import pytest
 
 from modus.config import ModusConfig
 from modus.tools.base import ToolContext
-from modus.tools.builtins import edit_file, glob_files, grep, list_dir, read_file, search_code, write_file
+from modus.tools.builtins import (
+    edit_file, get_builtin_tools, glob_files, grep, list_dir, read_file, search_code, write_file,
+)
 
 
 @pytest.fixture
@@ -286,3 +288,279 @@ async def test_edit_file_observes_cancellation_before_commit(guard_home):
 
     assert result.is_error is True
     assert target.read_text(encoding="utf-8") == "before\n"
+
+
+@pytest.mark.asyncio
+async def test_bounded_walker_prunes_skip_dirs(tmp_path, monkeypatch):
+    """The walker never descends into node_modules/.venv etc."""
+    from modus.tools.builtins import _iter_bounded_files
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    (root / "a.py").mkdir(parents=True)
+    (root / "a.py" / "keep.txt").write_text("keep", encoding="utf-8")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "skip.txt").write_text("skip", encoding="utf-8")
+    (root / ".venv").mkdir()
+    (root / ".venv" / "skip2.txt").write_text("skip2", encoding="utf-8")
+
+    paths = [p async for p in _iter_bounded_files(root)]
+
+    names = [str(p) for p in paths]
+    assert any("keep.txt" in name for name in names)
+    assert not any("skip.txt" in name for name in names)
+    assert not any("skip2.txt" in name for name in names)
+
+
+@pytest.mark.asyncio
+async def test_bounded_walker_stops_at_cap(tmp_path, monkeypatch):
+    """The walker stops scanning after _MAX_SCAN_FILES files."""
+    from modus.tools.builtins import _iter_bounded_files, _MAX_SCAN_FILES
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(_MAX_SCAN_FILES + 500):
+        (root / f"f{index}.txt").write_text("x", encoding="utf-8")
+
+    paths = [p async for p in _iter_bounded_files(root)]
+
+    assert len(paths) <= _MAX_SCAN_FILES
+
+
+@pytest.mark.asyncio
+async def test_search_code_uses_bounded_scan(tmp_path, monkeypatch):
+    """search_code on a tree with skip dirs ignores them."""
+    from modus.tools.builtins import search_code
+    from modus.config import ModusConfig
+    from modus.tools.base import ToolContext
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "app.py").write_text("def find_me():\n    pass\n", encoding="utf-8")
+    (root / "node_modules").mkdir()
+    (root / "node_modules" / "dep.js").write_text("find_me\n", encoding="utf-8")
+
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+    result = await search_code({"query": "find_me", "path": "."}, ctx)
+
+    assert not result.is_error
+    assert "src/app.py" in result.content
+    assert "node_modules" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_capture_stream_output_caps_at_boundary():
+    """_capture_stream_output kills a streaming command at the cap."""
+    import asyncio
+    from modus.tools.builtins import _capture_stream_output
+
+    proc = await asyncio.create_subprocess_shell(
+        "python3 -c 'import sys; sys.stdout.write(\"x\"*100000)'",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr, truncated, timed_out = await _capture_stream_output(proc, None, 30.0, cap=4096)
+
+    assert truncated is True
+    assert not timed_out
+    assert len(stdout) <= 4096 + 65536  # bounded near the cap
+    assert proc.returncode is not None  # process was terminated
+
+
+# ── scan-cap truncation disclosure (honest truncation, no silent cap) ──
+
+
+def _make_ctx_capped(root, cap=100):
+    from modus.config import ModusConfig
+
+    cfg = ModusConfig()
+    cfg.tools.max_scan_files = cap
+    return ToolContext(cwd=str(root), workspace_root=str(root), config=cfg)
+
+
+@pytest.mark.asyncio
+async def test_grep_discloses_scan_cap_truncation(tmp_path, monkeypatch):
+    from modus.tools.builtins import grep
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(150):
+        (root / f"f{index}.py").write_text("needle\n" if index % 30 == 0 else "x\n",
+                                            encoding="utf-8")
+
+    ctx = _make_ctx_capped(root, cap=100)
+    result = await grep({"pattern": "needle", "path": ".", "limit": 1000}, ctx)
+
+    assert not result.is_error
+    assert "needle" in result.content
+    assert "扫描达上限 100" in result.content  # honest truncation disclosure
+
+
+@pytest.mark.asyncio
+async def test_search_code_discloses_scan_cap_truncation(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(150):
+        (root / f"f{index}.py").write_text("needle\n" if index % 30 == 0 else "x\n",
+                                            encoding="utf-8")
+
+    ctx = _make_ctx_capped(root, cap=100)
+    result = await search_code({"query": "needle", "path": ".", "limit": 1000}, ctx)
+
+    assert not result.is_error
+    assert "needle" in result.content
+    assert "扫描达上限 100" in result.content
+
+
+@pytest.mark.asyncio
+async def test_glob_discloses_scan_cap_truncation(tmp_path, monkeypatch):
+    from modus.tools.builtins import glob_files
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(150):
+        (root / f"f{index}.py").write_text("x", encoding="utf-8")
+
+    ctx = _make_ctx_capped(root, cap=100)
+    result = await glob_files({"pattern": "**/*.py", "limit": 1000}, ctx)
+
+    assert not result.is_error
+    assert "扫描达上限 100" in result.content
+
+
+@pytest.mark.asyncio
+async def test_no_truncation_disclosure_when_under_cap(tmp_path, monkeypatch):
+    from modus.tools.builtins import grep
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(5):
+        (root / f"f{index}.py").write_text("needle\n", encoding="utf-8")
+
+    ctx = _make_ctx_capped(root, cap=100)
+    result = await grep({"pattern": "needle", "path": ".", "limit": 1000}, ctx)
+
+    assert not result.is_error
+    assert "扫描达上限" not in result.content
+    assert "needle" in result.content
+
+
+@pytest.mark.asyncio
+async def test_walker_on_truncate_callback_fires(tmp_path, monkeypatch):
+    from modus.tools.builtins import _iter_bounded_files, _MAX_SCAN_FILES
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    for index in range(_MAX_SCAN_FILES + 500):
+        (root / f"f{index}.txt").write_text("x", encoding="utf-8")
+
+    fired = []
+    paths = [p async for p in _iter_bounded_files(
+        root, cap=_MAX_SCAN_FILES,
+        on_truncate=lambda: fired.append(True),
+    )]
+
+    assert len(paths) <= _MAX_SCAN_FILES
+    assert fired  # the cap was hit and the callback disclosed it
+
+
+# ── search_code word_boundary exact-symbol mode ──
+
+
+@pytest.mark.asyncio
+async def test_search_code_default_is_substring(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.py").write_text("find_me()\nfind_me_again()\n", encoding="utf-8")
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+
+    result = await search_code({"query": "find_me", "path": ".", "limit": 50}, ctx)
+    assert "find_me_again" in result.content  # substring hits the longer name
+
+
+@pytest.mark.asyncio
+async def test_search_code_word_boundary_exact_symbol(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.py").write_text("find_me()\nfind_me_again()\n", encoding="utf-8")
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+
+    result = await search_code(
+        {"query": "find_me", "path": ".", "limit": 50, "word_boundary": True}, ctx,
+    )
+    assert "find_me_again" not in result.content
+    assert "find_me()" in result.content
+
+
+@pytest.mark.asyncio
+async def test_search_code_word_boundary_case_sensitive(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.py").write_text("USER = 1\nuser = 2\n", encoding="utf-8")
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+
+    upper = await search_code(
+        {"query": "USER", "path": ".", "limit": 50,
+         "word_boundary": True, "case_sensitive": True}, ctx,
+    )
+    assert "USER = 1" in upper.content
+    assert "user = 2" not in upper.content
+
+
+@pytest.mark.asyncio
+async def test_search_code_word_boundary_regex(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.py").write_text("handler_a()\nhandler_b()\nhandler_ab()\n", encoding="utf-8")
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+
+    result = await search_code(
+        {"query": "handler_[ab]", "path": ".", "limit": 50,
+         "regex": True, "word_boundary": True}, ctx,
+    )
+    assert "handler_a" in result.content
+    assert "handler_b" in result.content
+    assert "handler_ab" not in result.content  # underscore continues the identifier
+
+
+@pytest.mark.asyncio
+async def test_search_code_word_boundary_invalid_regex(tmp_path, monkeypatch):
+    from modus.tools.builtins import search_code
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.py").write_text("x", encoding="utf-8")
+    ctx = ToolContext(cwd=str(root), workspace_root=str(root), config=ModusConfig())
+
+    result = await search_code(
+        {"query": "([", "path": ".", "regex": True, "word_boundary": True}, ctx,
+    )
+    assert result.is_error
+    assert "invalid regex" in result.content
+
+
+def test_search_code_declares_word_boundary_param():
+    tools = {tool.name: tool for tool in get_builtin_tools()}
+    props = tools["search_code"].parameters["properties"]
+    assert "word_boundary" in props

@@ -593,4 +593,55 @@ def test_restored_context_recompacts_only_when_over_window(
         if m.role == "system" and "REFERENCE ONLY" in str(m.content)
     ]
     assert len(summaries) == 1
-    assert len(rebound.main_history) <= 4  # contract + summary + 2-tail
+    # contract + summary + recent tail; a retained user instruction may add one.
+    assert len(rebound.main_history) <= 5
+
+
+def test_compress_keeps_final_user_instruction():
+    """Compaction must never drop the last user request."""
+    from modus.agent.compressor import compress_messages
+
+    messages = [
+        Message(role="system", content="contract"),
+        Message(role="user", content="原始请求"),
+        Message(role="assistant", content="old reply"),
+        Message(role="user", content="活动请求"),
+        Message(role="assistant", content="active reply"),
+        Message(role="user", content="最终指令"),
+        Message(role="assistant", content="final"),
+    ]
+    out = compress_messages(messages, summary="s", tail_count=2)
+
+    contents = [str(m.content) for m in out]
+    assert "最终指令" in contents, "final user instruction must survive compaction"
+    assert "原始请求" not in contents  # old request is compacted away
+
+
+def test_compress_turn_aligns_tail_no_orphan_tool():
+    """Tail must never start on a tool message whose assistant was compacted."""
+    from modus.agent.compressor import compress_messages
+
+    messages = [
+        Message(role="system", content="contract"),
+        Message(role="user", content="request"),
+        Message(role="assistant", content="turn1", tool_calls=[
+            {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+        ]),
+        Message(role="tool", content="r1", tool_call_id="c1"),
+        Message(role="assistant", content="turn2", tool_calls=[
+            {"id": "c2", "function": {"name": "bash", "arguments": "{}"}},
+        ]),
+        Message(role="tool", content="r2", tool_call_id="c2"),
+        Message(role="assistant", content="turn3", tool_calls=[
+            {"id": "c3", "function": {"name": "bash", "arguments": "{}"}},
+        ]),
+        Message(role="tool", content="r3", tool_call_id="c3"),
+    ]
+    out = compress_messages(messages, summary="s", tail_count=3)
+
+    # Every tool message in the tail must have its assistant tool_call present.
+    tool_ids = {m.tool_call_id for m in out if m.role == "tool"}
+    assistant_ids = {
+        str(tc["id"]) for m in out if m.role == "assistant" for tc in (m.tool_calls or [])
+    }
+    assert tool_ids <= assistant_ids, f"orphaned tool ids: {tool_ids - assistant_ids}"

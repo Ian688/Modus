@@ -11,6 +11,10 @@ DangerLevel = Literal["safe", "medium", "high"]
 DataDisclosure = Literal["none", "workspace_metadata", "workspace_content"]
 ToolDecision = Literal["approve", "deny", "skip", "modify"]
 
+# Literal mirror of tools.capabilities.Capability — kept here so Tool
+# declarations read as plain strings without importing the enum.
+CapabilityClass = Literal["filesystem", "exec", "network", "memory", "agent"]
+
 # An approval callback may return a plain decision string, or a structured
 # ApprovalResponse.  ``Any`` keeps the forward reference to ApprovalResponse
 # from being evaluated at module load (it is defined below).
@@ -100,6 +104,13 @@ class ToolContext:
     # a side-git pre-turn snapshot has been captured for this run.  Guards
     # against capturing the same snapshot repeatedly across tool calls.
     _snapshot_taken: bool = False
+    # Capability grant set for the active run.  ``None`` (the default) grants
+    # every declared capability — today's unrestricted behavior.  An explicit
+    # set (e.g. ``["filesystem"]`` for a read-only lens run) makes the executor
+    # deny every tool that declares a capability outside the set, before
+    # approval.  Empty list means "deny everything declared"; tools with no
+    # declared capabilities are also denied under any explicit set.
+    granted_capabilities: list[str] | None = None
 
 @dataclass(slots=True)
 class Tool:
@@ -114,6 +125,11 @@ class Tool:
     # Describes what the tool result reveals to the current model. Workspace
     # binding alone never authorizes raw content disclosure.
     data_disclosure: DataDisclosure = "none"
+    # Capability classes this tool exercises.  The executor denies a tool under
+    # an explicit capability grant unless every declared class is granted.  An
+    # empty list means "no declared capability" — fine when no lockdown grant is
+    # active (``granted_capabilities=None`` grants everything), denied under one.
+    capabilities: tuple[CapabilityClass, ...] = ()
     timeout: float = 60.0
     required_keys: list[str] = field(default_factory=list)
 

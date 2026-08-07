@@ -164,3 +164,49 @@ def test_save_memory_tool_persists_with_session(monkeypatch):
     assert result.is_error is False
     contents = [m["content"] for m in memory.get_memories(sid)]
     assert "记住用 Python" in contents
+
+
+def test_memory_dedup_exact_content_updates_source_ids():
+    sid = _session()
+    first = db.add_memory_record(
+        session_id=sid, scope="session", content="用户偏好 Python", category="preference",
+        source_ids=["run-a"],
+    )
+    second = db.add_memory_record(
+        session_id=sid, scope="session", content="用户偏好 Python", category="preference",
+        source_ids=["run-b"],
+    )
+
+    # Same memory_id, provenance merged, no duplicate row.
+    assert second["memory_id"] == first["memory_id"]
+    assert set(second.get("source_ids") or []) == {"run-a", "run-b"}
+    assert len([m for m in db.list_memories(sid, scope="session")]) == 1
+
+
+def test_memory_dedup_high_overlap_archives_no_new_row():
+    sid = _session()
+    db.add_memory_record(
+        session_id=sid, scope="session", content="项目使用 pytest 与分层记忆", category="fact",
+    )
+    # Highly overlapping (same tokens, reordered) is treated as the same fact.
+    db.add_memory_record(
+        session_id=sid, scope="session", content="项目使用 pytest 与分层记忆（含记忆层）", category="fact",
+    )
+
+    assert len([m for m in db.list_memories(sid, scope="session")]) == 1
+
+
+def test_memory_dedup_distinct_facts_both_kept():
+    sid = _session()
+    db.add_memory_record(session_id=sid, scope="session", content="用户偏好 Python", category="preference")
+    db.add_memory_record(session_id=sid, scope="session", content="用户偏好 Go 写后端", category="preference")
+
+    assert len([m for m in db.list_memories(sid, scope="session")]) == 2
+
+
+def test_memory_dedup_opt_out_allows_duplicates():
+    sid = _session()
+    db.add_memory_record(session_id=sid, scope="session", content="同一条", category="fact")
+    db.add_memory_record(session_id=sid, scope="session", content="同一条", category="fact", dedup=False)
+
+    assert len([m for m in db.list_memories(sid, scope="session")]) == 2

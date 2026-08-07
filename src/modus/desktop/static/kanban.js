@@ -254,9 +254,8 @@
     const feed = activities
       ? '<div class="kb-drawer-section"><div class="kb-drawer-hd">活动</div><ol class="kb-activity-list">' + activities + "</ol></div>"
       : "";
-    const preview = run.previewUrl
-      ? '<div class="kb-drawer-section"><div class="kb-drawer-hd">预览</div><iframe class="kb-preview-frame" src="/api/preview?url=' + encodeURIComponent(String(run.previewUrl)) + '"></iframe></div>'
-      : "";
+    // The preview iframe lives statically in #kbPreviewSection (index.html);
+    // loadPreview (moduswindows.js) points it at /api/preview?url=….
     const artifacts = (run.artifacts || []).length
       ? '<div class="kb-drawer-section"><div class="kb-drawer-hd">产物</div><div class="wb-artifacts">'
         + run.artifacts.slice(-8).reverse().map(function (item) {
@@ -266,7 +265,7 @@
       : "";
     return '<div class="kb-drawer-inner">'
       + '<div class="kb-drawer-close" data-kb-close>×</div>'
-      + header + tasks + review + feed + preview + artifacts
+      + header + tasks + review + feed + artifacts
       + "</div>";
   }
 

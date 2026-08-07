@@ -424,6 +424,7 @@ def _make_spawn_subtask_tool(ctx: dict[str, Any]) -> Tool:
         is_concurrency_safe=False,
         danger_level="medium",
         requires_approval=False,
+        capabilities=("agent",),
     )
 
 
@@ -562,6 +563,9 @@ async def execute_subtask(
     context = ToolContext(
         cwd=cwd or os.getcwd(), config=config, cancel_event=cancel_event,
         approval_callback=effective_approval, session_id=session_id, run_id=run_id,
+        granted_capabilities=(
+            getattr(getattr(config, "policy", None), "capability_grant", None)
+        ),
     )
     definitions = safe_registry.definitions()
 

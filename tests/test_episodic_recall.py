@@ -135,3 +135,18 @@ def test_flat_dump_without_query_is_unchanged():
 
     text = memory.get_memory_context(sid)
     assert "Python" in text
+
+
+def test_verification_state_persisted_as_working_memory():
+    from modus.desktop.default_runner import _persist_verification_state
+
+    sid = db.create_session("verif-state")["id"]
+    run = db.create_run("run-verif", sid, "default")
+    _persist_verification_state(
+        type("S", (), {"db_id": sid})(), run["run_id"], "completed",
+        {"status": "passed", "mutation_generation": 1, "attempts": 2},
+    )
+
+    working = [m for m in db.list_memories(sid, scope="run")]
+    assert any("verification-state" == m.get("category") for m in working)
+    assert any("passed" in m.get("content", "") for m in working)

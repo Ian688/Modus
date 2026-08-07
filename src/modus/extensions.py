@@ -94,6 +94,7 @@ class ExtensionRegistry:
                     is_concurrency_safe=False,
                     danger_level="medium",
                     requires_approval=True,
+                    capabilities=("agent",),
                 )
                 tools.append(tool)
         await asyncio.sleep(0)

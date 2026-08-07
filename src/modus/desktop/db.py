@@ -1237,13 +1237,56 @@ def list_run_artifacts(run_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _memory_overlap(existing: str, incoming: str) -> float:
+    """Token-overlap ratio between two memory contents (0..1).
+
+    CJK is tokenized per character so a single shared character is weak; the
+    caller requires a high threshold (>= 0.90) before treating them as the same
+    fact, and that threshold applies to the smaller token set.
+    """
+    import re as _re
+    token_re = _re.compile(r"[A-Za-z0-9_\-]{2,}|[一-鿿]")
+    a = set(token_re.findall(existing or ""))
+    b = set(token_re.findall(incoming or ""))
+    if not a or not b:
+        return 0.0
+    smaller = min(len(a), len(b))
+    if smaller == 0:
+        return 0.0
+    return len(a & b) / smaller
+
+
 def add_memory_record(
     *, session_id: str, scope: str, content: str, category: str = "general",
     run_id: str | None = None, task_id: str | None = None,
     source_ids: list[str] | None = None, reference_only: bool = True,
+    dedup: bool = True,
 ) -> dict[str, Any]:
     if scope not in {"run", "task", "session", "project"}:
         raise ValueError("memory scope must be run, task, session or project")
+    content = str(content or "").strip()
+    if not content:
+        raise ValueError("memory content is required")
+
+    if dedup:
+        # Idempotent writes: an exact or near-identical memory in the same
+        # scope+category is not duplicated; its updated_at is refreshed and
+        # its provenance (source_ids) merged.  This makes auto-memorize /
+        # working-memory persistence safe to run repeatedly.
+        existing = _find_duplicate_memory(
+            session_id, scope, category, content, run_id=run_id, task_id=task_id,
+        )
+        if existing is not None:
+            merged_sources = list(dict.fromkeys([
+                *(existing.get("source_ids") or []),
+                *(source_ids or []),
+            ]))
+            _update_memory_provenance(
+                existing["memory_id"], merged_sources,
+            )
+            refreshed = get_memory(existing["memory_id"])
+            return refreshed or existing
+
     memory_id = f"mem_{uuid.uuid4().hex}"
     now = time.time()
     with _get_conn() as conn:
@@ -1260,6 +1303,48 @@ def add_memory_record(
             ),
         )
     return get_memory(memory_id) or {}
+
+
+def _find_duplicate_memory(
+    session_id: str, scope: str, category: str, content: str,
+    *, run_id: str | None = None, task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return an existing active memory in the same scope+category that is
+    exact or highly overlapping, or None."""
+    clauses = ["session_id=?", "status='active'", "scope=?", "category=?"]
+    values: list[Any] = [session_id, scope, category]
+    if scope in {"run", "task"}:
+        if run_id is not None:
+            clauses.append("run_id=?")
+            values.append(run_id)
+        if task_id is not None:
+            clauses.append("task_id=?")
+            values.append(task_id)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT memory_id FROM memories WHERE {' AND '.join(clauses)} LIMIT 50",
+            values,
+        ).fetchall()
+    for row in rows:
+        mem = get_memory(str(row["memory_id"]))
+        if mem is None:
+            continue
+        if str(mem.get("content") or "") == content:
+            return mem
+        if _memory_overlap(str(mem.get("content") or ""), content) >= 0.90:
+            return mem
+    return None
+
+
+def _update_memory_provenance(memory_id: str, source_ids: list[str]) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE memories SET source_ids=?, updated_at=? WHERE memory_id=?",
+            (
+                json.dumps(source_ids, ensure_ascii=False),
+                time.time(), memory_id,
+            ),
+        )
 
 
 def get_memory(memory_id: str) -> dict[str, Any] | None:

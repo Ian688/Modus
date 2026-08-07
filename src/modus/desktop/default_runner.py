@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from modus.desktop.db import add_message, settle_run_event, update_session
+from modus.desktop.db import add_message, settle_run_event, update_run, update_session
 from modus.desktop.events import Actor, ChannelId, EventStatus, EventType, RunEventEmitter
 from modus.desktop.memory import consolidate_run_memories
 from modus.modes import DEFAULT_MODE
@@ -85,6 +85,38 @@ async def _persist_self_report(session: Any, run_id: str | None) -> None:
         )
     except Exception:
         logger.debug("self-report persistence failed", exc_info=True)
+
+
+def _persist_verification_state(
+    session: Any, run_id: str | None, stop_reason: str,
+    verification: dict | None,
+) -> None:
+    """Persist the run's final verification state as run working memory.
+
+    A later run with a similar goal can recall this via the memory/recall
+    injection ("this was last verified / last failed verification") and avoid
+    redoing already-verified work.  Best-effort; never raises.
+    """
+    if not session.db_id or not run_id:
+        return
+    try:
+        from modus.desktop.orchestration_ledger import persist_working_memory
+
+        verification = verification or {}
+        status = str(verification.get("status") or "not_required")
+        mutations = bool(verification.get("has_mutations") or verification.get("mutation_generation", 0) > 0)
+        attempts = int(verification.get("attempts") or 0)
+        content = (
+            f"上次 run 验证状态：status={status}, stop_reason={stop_reason}, "
+            f"has_mutations={mutations}, verification_attempts={attempts}"
+        )
+        persist_working_memory(
+            session_id=session.db_id, run_id=run_id,
+            category="verification-state",
+            content=content,
+        )
+    except Exception:
+        logger.debug("verification-state persistence failed", exc_info=True)
 
 
 def _settle_terminal_fallback(
@@ -302,6 +334,11 @@ async def stream_to_ws(
     completed_normally = False
     provider_terminal_received = False
     budget_token = bind_run_budget(controller.budget)
+    # Periodic budget snapshots: every N tool results, persist the live budget
+    # so a crashed / power-lost run leaves a recoverable state instead of a
+    # forever-``running`` SQLite row with an empty budget column.
+    _tool_result_count = 0
+    _BUDGET_SNAPSHOT_EVERY = 5
     if verification_required:
         controller.budget.verification.require_verification()
     from modus.agent.context import SessionContextProvider
@@ -405,6 +442,20 @@ async def stream_to_ws(
                     parent_event_id=tool_event_ids.get(tool_call_id),
                     artifact_ids=artifact_ids,
                 )
+                # Persist the live budget periodically so an interrupted run
+                # (crash / power loss / SIGKILL) leaves a recoverable state.
+                # Best-effort and never raised: a snapshot failure must not
+                # disturb the run.
+                _tool_result_count += 1
+                if session.db_id and emitter.run_id and _tool_result_count % _BUDGET_SNAPSHOT_EVERY == 0:
+                    try:
+                        update_run(
+                            emitter.run_id,
+                            state="running",
+                            budget=controller.budget.snapshot(),
+                        )
+                    except Exception:
+                        logger.debug("periodic budget snapshot failed", exc_info=True)
             elif event_type == "usage":
                 # Usage is accounted for by the run budget and included in the
                 # terminal event/control packet.  It has no separate rendering
@@ -421,6 +472,7 @@ async def stream_to_ws(
                     "cancelled": StopReason.CANCELLED,
                     "engine_error": StopReason.ENGINE_ERROR,
                     "failed": StopReason.FAILED,
+                    "no_progress": StopReason.NO_PROGRESS,
                     "verification_required": StopReason.VERIFICATION_REQUIRED,
                     "verification_retry_limit": StopReason.VERIFICATION_RETRY_LIMIT,
                 }
@@ -484,6 +536,10 @@ async def stream_to_ws(
                     ) is not None:
                         await _maybe_consolidate(session, message)
                     await _persist_self_report(session, emitter.run_id)
+                    _persist_verification_state(
+                        session, emitter.run_id, stop_reason,
+                        (event.get("verification") or {}),
+                    )
                 elif stop_reason in {"max_turns", "token_limit", "wall_time"}:
                     await emitter.emit(
                         EventType.RUN_ERROR, ChannelId.USER_HOST, Actor.system(),
@@ -496,6 +552,8 @@ async def stream_to_ws(
                         if stop_reason == "verification_required"
                         else "验证连续失败，已达到自动修复重试上限。"
                         if stop_reason == "verification_retry_limit"
+                        else "连续多轮未产生进展（无新输出、无成功工具调用），已停止运行。"
+                        if stop_reason == "no_progress"
                         else f"Run stopped: {stop_reason}"
                     )
                     await emitter.emit(

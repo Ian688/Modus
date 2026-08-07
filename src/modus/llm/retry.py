@@ -34,6 +34,7 @@ def retry_chat(
     *,
     max_attempts: int = 2,
     retryable_status: tuple[int, ...] = (429, 500, 502, 503, 529),
+    classify: Any = None,
 ) -> Any:
     """Wrap an ``async def chat(...) -> AsyncIterator`` with safe transient retry.
 
@@ -45,11 +46,55 @@ def retry_chat(
     (aborts when remaining wall time < backoff, or on cancel) so a flaky
     provider can never inflate a run.
 
+    Whether a zero-output error is retried is decided by ``classify``: a callable
+    ``(message: str) -> bool`` that returns True for retryable reasons.  The
+    default uses ``classify_api_error`` + ``recovery_policy`` so 429/5xx/timeout
+    retry with backoff while auth/billing/context_overflow/400 fail fast.
+
     ``chat`` receives the same ``(messages, tools, *, system_prompt)`` args each
     attempt and is expected to be an async generator that yields typed events.
     """
     if max_attempts < 1:
         max_attempts = 1
+
+    if classify is None:
+        from modus.llm.errors import (
+            FailoverReason, RecoveryAction, classify_api_error, recovery_policy,
+        )
+
+        def _default_classify(message: str) -> bool:
+            # Extract an HTTP status from "API <code>: ..." style messages.
+            status = 0
+            prefix = "api "
+            if message.lower().startswith(prefix):
+                try:
+                    status = int(message[len(prefix): message.index(":")])
+                except (ValueError, IndexError):
+                    status = 0
+            lower = message.lower()
+            if status == 0 and any(
+                token in lower for token in ("connection", "timed out", "timeout",
+                                             "read error", "reset", "stream interrupted")
+            ):
+                # Transport-level failures without an HTTP status are transient.
+                return True
+            classified = classify_api_error(RuntimeError(message), status)
+            return recovery_policy(classified.reason) is RecoveryAction.RETRY_WITH_BACKOFF
+
+        classify = _default_classify
+
+    def _classify_failover(message: str) -> str:
+        """Return the classified FailoverReason value for a provider error."""
+        from modus.llm.errors import classify_api_error
+
+        status = 0
+        prefix = "api "
+        if message.lower().startswith(prefix):
+            try:
+                status = int(message[len(prefix): message.index(":")])
+            except (ValueError, IndexError):
+                status = 0
+        return classify_api_error(RuntimeError(message), status).reason.value
 
     async def retrying_chat(messages, tools, *, system_prompt) -> AsyncIterator[dict[str, Any]]:
         attempt = 0
@@ -80,14 +125,22 @@ def retry_chat(
             if not saw_error:
                 # Clean stream end with no error and no delta.
                 return
+            if not classify(last_error):
+                # Classified as non-retryable (auth/billing/context_overflow/
+                # 400): surface it, do not burn attempts.
+                yield {"type": "error", "error": last_error,
+                       "failover": _classify_failover(last_error)}
+                return
             if attempt >= max_attempts:
-                yield {"type": "error", "error": last_error}
+                yield {"type": "error", "error": last_error,
+                       "failover": _classify_failover(last_error)}
                 return
             # Zero-output transient failure: retry with backoff, budget-aware.
             budget = active_run_budget()
             delay = jittered_backoff(attempt, base_delay=0.5, max_delay=4.0)
             if budget is not None and budget.remaining_wall_seconds < delay:
-                yield {"type": "error", "error": last_error}
+                yield {"type": "error", "error": last_error,
+                       "failover": _classify_failover(last_error)}
                 return
             await asyncio.sleep(delay)
         return

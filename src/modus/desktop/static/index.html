@@ -97,7 +97,20 @@
         <div class="kb-focus"><span>当前聚焦</span><b id="wvBody" data-state="idle">等待任务...</b></div>
       </div>
       <div id="kbColumns" class="kb-columns" role="list"></div>
-      <div id="kbDrawer" class="kb-drawer" hidden></div>
+      <div id="kbDrawer" class="kb-drawer" hidden>
+        <div class="kb-drawer-section" id="kbPreviewSection" hidden>
+          <div class="kb-drawer-hd">
+            <span>预览</span>
+            <button type="button" id="kbAnnotateBtn" class="kb-annotate-btn" title="选中页面元素并添加点评">批注</button>
+          </div>
+          <iframe id="kbPreviewFrame" class="kb-preview-frame" title="浏览器预览"></iframe>
+          <div id="kbAnnotationBar" class="kb-annotation-bar" hidden>
+            <span id="kbAnnotationCount">0 个元素</span>
+            <button type="button" id="kbAnnotationSend" disabled>发送点评给 Agent</button>
+            <button type="button" id="kbAnnotationClear">清空</button>
+          </div>
+        </div>
+      </div>
       <div id="kbDocument" hidden></div>
     </div>
   </aside>

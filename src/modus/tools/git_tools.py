@@ -491,6 +491,55 @@ async def git_branch_list(payload: dict[str, Any], context: ToolContext) -> Tool
     return ToolResult(stdout.strip() or "（无分支）")
 
 
+async def git_log(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    """Read-only recent commit history with a bounded oneline view."""
+    cwd = context.cwd or os.getcwd()
+    count = max(1, min(int(payload.get("count") or 20), 100))
+    path = str(payload.get("path") or "").strip()
+    cmd = ["git", "log", "-n", str(count), "--oneline", "--decorate"]
+    if path:
+        cmd.extend(["--", path])
+    stdout, stderr, code = await _git(cmd, cwd=cwd)
+    if code != 0:
+        return ToolResult(f"✗ git log failed: {stderr.strip()[:300]}", is_error=True)
+    return ToolResult(stdout.strip() or "（无提交历史）")
+
+
+async def git_show(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    """Read-only detail of one commit: message, files, and bounded diff."""
+    cwd = context.cwd or os.getcwd()
+    rev = str(payload.get("rev") or "").strip()
+    if not rev:
+        return ToolResult("git_show requires a 'rev' (commit hash or ref)", is_error=True)
+    stat = str(payload.get("stat") or "").strip()
+    if stat == "stat":
+        cmd = ["git", "show", "--stat", "--oneline", rev]
+    else:
+        # Bounded diff: oneline metadata + file list + compact diff.
+        cmd = ["git", "show", "--format=%h %s%n%an <%ae>%n%ad", "--date=short",
+               "-U2", "--stat", rev]
+    stdout, stderr, code = await _git(cmd, cwd=cwd)
+    if code != 0:
+        return ToolResult(f"✗ git show failed: {stderr.strip()[:300]}", is_error=True)
+    return ToolResult(stdout.strip()[:12000] or "(empty commit)")
+
+
+async def git_blame(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    """Read-only per-line attribution for a file (who/when changed each line)."""
+    cwd = context.cwd or os.getcwd()
+    path = str(payload.get("path") or "").strip()
+    if not path:
+        return ToolResult("git_blame requires a 'path'", is_error=True)
+    rev = str(payload.get("rev") or "").strip()
+    cmd = ["git", "blame", path]
+    if rev:
+        cmd.insert(2, rev)
+    stdout, stderr, code = await _git(cmd, cwd=cwd)
+    if code != 0:
+        return ToolResult(f"✗ git blame failed: {stderr.strip()[:300]}", is_error=True)
+    return ToolResult(stdout.strip()[:12000] or "(no blame output)")
+
+
 async def git_branch_create(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     branch = str(payload.get("branch") or "").strip()
     base = str(payload.get("base") or "").strip()

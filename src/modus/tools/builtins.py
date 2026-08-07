@@ -18,7 +18,38 @@ from modus.policy.path_guard import PathPolicyError
 from modus.redact import redact_text
 from modus.sandbox import rlimit_preexec
 from modus.tools.base import Tool, ToolContext, ToolResult, object_schema
+from modus.tools.browser import (
+    browser_click,
+    browser_close,
+    browser_eval,
+    browser_extract,
+    browser_navigate,
+    browser_screenshot,
+    browser_state,
+    browser_type,
+)
+from modus.tools.office import (
+    excel_analyze,
+    excel_query,
+    pptx_build,
+    pptx_extract,
+    word_edit,
+    word_extract,
+)
+from modus.tools.office_exec import office_exec
 from modus.tools.payload import bounded_for_model
+from modus.tools.system_control import (
+    port_list,
+    service_restart,
+    service_status,
+)
+from modus.tools.process_tools import (
+    kill_process,
+    list_processes,
+    spawn_process,
+    tail_process,
+)
+from modus.tools.system_probe import system_probe
 
 from modus.web.search import search_web
 from modus.web.fetch import fetch_url
@@ -48,14 +79,37 @@ async def glob_files(payload: dict[str, Any], context: ToolContext) -> ToolResul
         _resolve_path(context, _glob_anchor(pattern))
         base = Path(context.workspace_root or context.cwd).resolve()
         limit = int(payload.get("limit") or 100)
-        matches = glob_module.glob(str(base / pattern), recursive=True)
         rels: list[str] = []
-        guard = PathGuard()
-        for match in sorted(matches):
-            path = guard.validate(match, base=base)
-            rels.append(str(path.relative_to(base)))
-            if len(rels) >= limit:
-                break
+
+        if "**" in pattern:
+            # Recursive glob: use the bounded walker so ``**`` on a huge tree
+            # cannot peg the CPU, then fnmatch the pattern against each file.
+            import fnmatch
+
+            pattern_str = str(base / pattern)
+            truncated = {"hit": False}
+
+            def _mark_truncated() -> None:
+                truncated["hit"] = True
+
+            async for path in _iter_bounded_files(
+                base, _scan_cap(context), on_truncate=_mark_truncated,
+            ):
+                if fnmatch.fnmatch(str(path), pattern_str):
+                    rels.append(str(path.relative_to(base)))
+                    if len(rels) >= limit:
+                        break
+            if truncated["hit"]:
+                cap = _scan_cap(context)
+                rels.append(f"... [扫描达上限 {cap} 文件，结果不完整]")
+        else:
+            raw_matches = glob_module.glob(str(base / pattern), recursive=False)
+            guard = PathGuard()
+            for match in sorted(raw_matches):
+                path = guard.validate(match, base=base)
+                rels.append(str(path.relative_to(base)))
+                if len(rels) >= limit:
+                    break
         return ToolResult("\n".join(rels) or "(no matches)")
     except PathPolicyError as exc:
         return _path_error(exc)
@@ -257,22 +311,34 @@ async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
             return ToolResult(f"invalid regex: {exc}", is_error=True)
 
         matches: list[str] = []
-        files = [start] if start.is_file() else [p for p in start.rglob("*") if p.is_file()]
-        guard = PathGuard()
-        for file_path in files:
-            # A nested symlink can appear during recursive traversal; validate
-            # every discovered path, not only the requested starting directory.
-            resolved = guard.validate(file_path)
-            if _skip_file(resolved):
-                continue
-            lines = resolved.read_text(encoding="utf-8", errors="ignore").splitlines()
+        truncated = {"hit": False}
+
+        def _mark_truncated() -> None:
+            truncated["hit"] = True
+
+        async def _all_candidates():
+            if start.is_file():
+                yield start
+            else:
+                async for path in _iter_bounded_files(
+                    start, _scan_cap(context), on_truncate=_mark_truncated,
+                ):
+                    yield path
+
+        async for file_path in _all_candidates():
+            lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
             for line_number, line in enumerate(lines, start=1):
                 found = bool(compiled.search(line)) if compiled else pattern in line
                 if found:
-                    matches.append(f"{_display_path(resolved, root)}:{line_number}: {line.strip()}")
+                    matches.append(f"{_display_path(file_path, root)}:{line_number}: {line.strip()}")
                     if len(matches) >= limit:
                         return ToolResult("\n".join(matches))
-        return ToolResult("\n".join(matches) or "(no matches)")
+        if truncated["hit"]:
+            cap = _scan_cap(context)
+            footer = f"\n... [扫描达上限 {cap} 文件，结果不完整]"
+        else:
+            footer = ""
+        return ToolResult("\n".join(matches) + footer if matches else (f"(no matches){footer}"))
     except PathPolicyError as exc:
         return _path_error(exc)
 
@@ -344,11 +410,104 @@ def _resolve_path(context: ToolContext, value: str) -> Path:
     """
     return PathGuard().validate(value, base=context.workspace_root or context.cwd)
 
+_SKIP_DIRS = frozenset({
+    ".git", ".venv", "node_modules", "dist", "build", "__pycache__",
+    ".next", ".cache", "target", "Pods", "vendor", ".tox",
+})
+
+# Hard cap on files scanned by any recursive walker, so a single tool call on a
+# huge tree cannot pin a core for minutes (see audit MF3).  Raised from 5k to
+# cover real source trees (Modus itself has ~4k non-venv files); the
+# ``tools.max_scan_files`` config overrides.
+_MAX_SCAN_FILES = 20_000
+
+# Hard cap on shell output buffered per call.  A command that streams output
+# without exiting is killed at this boundary instead of OOMing the process.
+_STREAM_OUTPUT_CAP = 50 * 1024 * 1024
+
+# Environment variable names that must never leak into a shell subprocess.
+_ENV_SECRET_MARKERS = ("key", "token", "secret", "password", "credential",
+                       "auth", "bearer", "session")
+
+
+def _safe_shell_env() -> dict[str, str]:
+    """Return a sanitized environment for shell subprocesses.
+
+    A command the model runs must not inherit every host secret (API keys,
+    tokens, credentials).  We keep the base path/locale machinery but drop any
+    variable whose name carries a secret marker, so ``env`` / ``printenv`` can
+    never exfiltrate ``MODUS_API_KEY``, ``OPENAI_API_KEY`` etc. to the model.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not any(marker in key.lower() for marker in _ENV_SECRET_MARKERS)
+    }
+
+
+def _scan_cap(context: ToolContext) -> int:
+    """Read the configured file-scan cap, clamped to a sane range."""
+    value = getattr(getattr(context.config, "tools", None), "max_scan_files", _MAX_SCAN_FILES)
+    return max(100, min(int(value or _MAX_SCAN_FILES), 200_000))
+
+
 def _skip_file(path: Path) -> bool:
-    skip_dirs = {".git", ".venv", "node_modules", "dist", "build"}
-    if any(part in skip_dirs for part in path.parts):
+    if any(part in _SKIP_DIRS for part in path.parts):
         return True
     return path.stat().st_size > 1_000_000
+
+
+async def _iter_bounded_files(start: Path, cap: int = _MAX_SCAN_FILES, *, on_truncate=None):
+    """Yield files under ``start`` with pruning and a hard scan cap.
+
+    Asynchronous generator: yields to the event loop every 128 entries so the
+    tool timeout and run-cancel can interrupt a large scan, prunes
+    ``_SKIP_DIRS`` during traversal (never descends into them), and stops after
+    ``cap`` files so a runaway directory cannot peg the CPU.
+
+    ``on_truncate`` is invoked (with no args) when the scan stops because the
+    cap was reached, so the caller can disclose that the result is incomplete —
+    a silent cap would read as a complete scan and mislead the model.
+    """
+    scanned = 0
+    visited = 0
+    stack = [start]
+    guard = PathGuard()
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited % 128 == 0:
+                        await asyncio.sleep(0)
+                    name = entry.name
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if is_dir:
+                        if name in _SKIP_DIRS:
+                            continue
+                        stack.append(Path(entry.path))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    path = Path(entry.path)
+                    try:
+                        resolved = guard.validate(path)
+                    except PathPolicyError:
+                        continue
+                    if _skip_file(resolved):
+                        continue
+                    yield resolved
+                    scanned += 1
+                    if scanned >= cap:
+                        if on_truncate is not None:
+                            on_truncate()
+                        return
+        except (OSError, PermissionError):
+            continue
 
 
 def _display_path(path: Path, base: Path) -> str:
@@ -371,6 +530,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["path"],
             handler=list_dir,
             data_disclosure="workspace_metadata",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="glob",
@@ -382,6 +542,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["pattern"],
             handler=glob_files,
             data_disclosure="workspace_metadata",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="read_file",
@@ -393,6 +554,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["path"],
             handler=read_file,
             data_disclosure="workspace_content",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="write_file",
@@ -405,6 +567,7 @@ def get_builtin_tools() -> list[Tool]:
             handler=write_file,
             is_read_only=False,
             danger_level="medium",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="edit_file",
@@ -424,6 +587,7 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="grep",
@@ -435,6 +599,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["pattern"],
             handler=grep,
             data_disclosure="workspace_content",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="save_memory",
@@ -450,6 +615,7 @@ def get_builtin_tools() -> list[Tool]:
             handler=save_memory,
             is_read_only=False,
             danger_level="medium",
+            capabilities=("memory",),
         ),
         Tool(
             name="search_memory",
@@ -462,6 +628,7 @@ def get_builtin_tools() -> list[Tool]:
             handler=search_memory,
             is_read_only=True,
             is_concurrency_safe=True,
+            capabilities=("memory",),
         ),
         Tool(
             name="search_code",
@@ -472,6 +639,8 @@ def get_builtin_tools() -> list[Tool]:
                     "path": {"type": "string", "description": "Workspace-relative file or directory"},
                     "regex": {"type": "boolean", "description": "Interpret query as a regular expression"},
                     "case_sensitive": {"type": "boolean"},
+                    "word_boundary": {"type": "boolean", "description": "Match whole identifiers only (find_me misses find_me_again)"},
+                    "use_index": {"type": "boolean", "description": "Use the persisted code index instead of a live scan (default false; falls back to scan if no index exists)"},
                     "context_lines": {"type": "number", "description": "Lines around each match (0-3)"},
                     "limit": {"type": "number", "description": "Maximum matches (1-1000)"},
                 },
@@ -480,6 +649,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["query"],
             handler=search_code,
             data_disclosure="workspace_content",
+            capabilities=("filesystem",),
         ),
         Tool(
             name="load_skill",
@@ -490,6 +660,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["name"],
             handler=load_skill,
+            capabilities=("filesystem",),
         ),
 
         Tool(
@@ -505,6 +676,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            capabilities=("exec",),
         ),
         Tool(
             name="run_tests",
@@ -524,6 +696,7 @@ def get_builtin_tools() -> list[Tool]:
             danger_level="high",
             requires_approval=True,
             timeout=3700.0,
+            capabilities=("exec",),
         ),
         Tool(
             name="revert_turn",
@@ -546,6 +719,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            capabilities=("filesystem", "exec"),
         ),
         Tool(
             name="web_search",
@@ -556,6 +730,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["query"],
             handler=web_search,
+            capabilities=("network",),
         ),
         Tool(
             name="web_fetch",
@@ -566,6 +741,385 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["url"],
             handler=web_fetch,
+            capabilities=("network",),
+        ),
+        Tool(
+            name="system_probe",
+            description=(
+                "Return a bounded JSON snapshot of the host: cpu/load, memory, "
+                "disk usage, top processes, and log directory summary. "
+                "Read-only lens — never reads file or log contents."
+            ),
+            parameters=object_schema(
+                {
+                    "max_processes": {"type": "number", "description": "Max process rows (default 20)"},
+                    "include_logs": {"type": "boolean", "description": "Include log directory summary (default true)"},
+                },
+                [],
+            ),
+            handler=system_probe,
+            data_disclosure="none",
+            capabilities=("filesystem",),
+            timeout=15.0,
+        ),
+        Tool(
+            name="spawn_process",
+            description=(
+                "Launch a command as a background process detached from this "
+                "call, logging stdout/stderr to Modus's private directory. "
+                "Returns a process_id for list/tail/kill_process. Use for "
+                "dev servers, long builds, or anything that outlives bash."
+            ),
+            parameters=object_schema(
+                {
+                    "command": {"type": "string", "description": "Shell command"},
+                    "cwd": {"type": "string", "description": "Working directory"},
+                    "task_name": {"type": "string", "description": "Optional task name for the process registry"},
+                    "description": {"type": "string", "description": "Optional human-readable task description"},
+                },
+                ["command"],
+            ),
+            required_keys=["command"],
+            handler=spawn_process,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="high",
+            requires_approval=True,
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="list_processes",
+            description=(
+                "List background processes spawned by spawn_process with live "
+                "status (running/stopped/orphaned/exited). Read-only."
+            ),
+            parameters=object_schema(
+                {"limit": {"type": "number", "description": "Max rows (default 20)"}},
+                [],
+            ),
+            handler=list_processes,
+            data_disclosure="none",
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="tail_process",
+            description=(
+                "Read a bounded tail of a spawned process's stdout (or stderr) "
+                "log. Non-blocking."
+            ),
+            parameters=object_schema(
+                {
+                    "process_id": {"type": "string"},
+                    "stream": {"type": "string", "description": "stdout or stderr"},
+                },
+                ["process_id"],
+            ),
+            required_keys=["process_id"],
+            handler=tail_process,
+            data_disclosure="none",
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="kill_process",
+            description=(
+                "Terminate a spawned process group and mark its registry entry "
+                "as exited."
+            ),
+            parameters=object_schema(
+                {"process_id": {"type": "string"}},
+                ["process_id"],
+            ),
+            required_keys=["process_id"],
+            handler=kill_process,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="high",
+            requires_approval=True,
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="rebuild_code_index",
+            description=(
+                "Build or refresh the persistent code-search index for the "
+                "workspace, so search_code can use use_index for fast queries. "
+                "Read-only (writes only Modus's private index dir)."
+            ),
+            parameters=object_schema({}, []),
+            handler=rebuild_code_index,
+            data_disclosure="none",
+            capabilities=("filesystem",),
+        ),
+        # Browser tools: shared headless Chrome driven by the agent.  All are
+        # non-concurrency-safe because they share one page; browser_eval is the
+        # only approval-gated one (arbitrary JS).
+        Tool(
+            name="browser_navigate",
+            description=(
+                "Navigate the shared headless browser to a URL. Use after "
+                "spawn_process started a dev server: pass its localhost URL. "
+                "Sets metadata.preview_url so the desktop preview iframe opens "
+                "the same page."
+            ),
+            parameters=object_schema(
+                {"url": {"type": "string", "description": "http/https URL to open"}},
+                ["url"],
+            ),
+            required_keys=["url"],
+            handler=browser_navigate,
+            is_concurrency_safe=False,
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_state",
+            description="Return the current page URL, title, visible links and inputs.",
+            parameters=object_schema({}, []),
+            handler=browser_state,
+            is_concurrency_safe=False,
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_extract",
+            description="Extract text or an attribute from all elements matching a CSS selector.",
+            parameters=object_schema(
+                {
+                    "selector": {"type": "string"},
+                    "attr": {"type": "string", "description": "Attribute to extract (default: innerText)"},
+                    "limit": {"type": "number", "description": "Max results (1-100)"},
+                },
+                ["selector"],
+            ),
+            required_keys=["selector"],
+            handler=browser_extract,
+            is_concurrency_safe=False,
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_screenshot",
+            description="Capture a viewport screenshot of the current page as an artifact.",
+            parameters=object_schema({}, []),
+            handler=browser_screenshot,
+            is_concurrency_safe=False,
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_click",
+            description="Click the first element matching a CSS selector.",
+            parameters=object_schema(
+                {"selector": {"type": "string"}},
+                ["selector"],
+            ),
+            required_keys=["selector"],
+            handler=browser_click,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_type",
+            description="Type text into the first element matching a CSS selector.",
+            parameters=object_schema(
+                {"selector": {"type": "string"}, "text": {"type": "string"}},
+                ["selector", "text"],
+            ),
+            required_keys=["selector", "text"],
+            handler=browser_type,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_eval",
+            description=(
+                "Evaluate a JS expression in the page and return the result. "
+                "Arbitrary code execution — requires approval."
+            ),
+            parameters=object_schema(
+                {"js": {"type": "string", "description": "JS expression (max 4096 chars)"}},
+                ["js"],
+            ),
+            required_keys=["js"],
+            handler=browser_eval,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="high",
+            requires_approval=True,
+            capabilities=("exec", "network"),
+        ),
+        Tool(
+            name="browser_close",
+            description="Close the shared headless browser and release its resources.",
+            parameters=object_schema({}, []),
+            handler=browser_close,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            capabilities=("exec", "network"),
+        ),
+        # Office document tools: binary formats (xlsx/docx/pptx) that the text
+        # tools cannot read.  Read tools auto-ALLOW and disclose workspace
+        # content; write tools go through the approval gate.
+        Tool(
+            name="excel_analyze",
+            description=(
+                "Analyze an Excel workbook: sheets, dimensions, header, preview "
+                "rows, and numeric stats. Read-only."
+            ),
+            parameters=object_schema(
+                {"path": {"type": "string", "description": "Path to .xlsx"}},
+                ["path"],
+            ),
+            required_keys=["path"],
+            handler=excel_analyze,
+            data_disclosure="workspace_content",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="excel_query",
+            description=(
+                "Filter Excel rows by a column value (equals) or numeric range "
+                "(gt). Read-only."
+            ),
+            parameters=object_schema(
+                {
+                    "path": {"type": "string"},
+                    "column": {"type": "string", "description": "Column name"},
+                    "equals": {"type": "string", "description": "Exact match value"},
+                    "gt": {"type": "number", "description": "Rows where column > gt"},
+                    "limit": {"type": "number", "description": "Max rows (1-200)"},
+                },
+                ["path", "column"],
+            ),
+            required_keys=["path", "column"],
+            handler=excel_query,
+            data_disclosure="workspace_content",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="word_extract",
+            description="Extract paragraphs, headings and table text from a .docx. Read-only.",
+            parameters=object_schema(
+                {"path": {"type": "string", "description": "Path to .docx"}},
+                ["path"],
+            ),
+            required_keys=["path"],
+            handler=word_extract,
+            data_disclosure="workspace_content",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="word_edit",
+            description="Replace an exact text occurrence across a .docx's paragraphs.",
+            parameters=object_schema(
+                {
+                    "path": {"type": "string"},
+                    "find": {"type": "string", "description": "Exact text to find"},
+                    "replace": {"type": "string", "description": "Replacement text"},
+                },
+                ["path", "find", "replace"],
+            ),
+            required_keys=["path", "find", "replace"],
+            handler=word_edit,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="pptx_extract",
+            description="Extract slide titles and text bodies from a .pptx. Read-only.",
+            parameters=object_schema(
+                {"path": {"type": "string", "description": "Path to .pptx"}},
+                ["path"],
+            ),
+            required_keys=["path"],
+            handler=pptx_extract,
+            data_disclosure="workspace_content",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="pptx_build",
+            description="Build a simple .pptx from a list of {title, body} slide specs.",
+            parameters=object_schema(
+                {
+                    "path": {"type": "string", "description": "Output .pptx path"},
+                    "slides": {"type": "array", "description": "List of {title, body} dicts"},
+                },
+                ["path", "slides"],
+            ),
+            required_keys=["path", "slides"],
+            handler=pptx_build,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            capabilities=("filesystem",),
+        ),
+        Tool(
+            name="office_exec",
+            description=(
+                "Run a sandboxed Python script that reads or writes ONE Office "
+                "file via openpyxl/python-docx/python-pptx.  The script sees "
+                "the target path as PATH; import a writing library (docx/pptx) "
+                "or call .save() to make this approval-gated.  Use for analysis "
+                "(aggregate/filter/group) and formatting the fixed tools cannot "
+                "do."
+            ),
+            parameters=object_schema(
+                {
+                    "path": {"type": "string", "description": "Target .xlsx/.docx/.pptx"},
+                    "script": {"type": "string", "description": "Python script (max 4000 chars)"},
+                },
+                ["path", "script"],
+            ),
+            required_keys=["path", "script"],
+            handler=office_exec,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            requires_approval=True,
+            capabilities=("filesystem", "exec"),
+        ),
+        # System control tools (Phase A5): ports read-only, service restart T4.
+        Tool(
+            name="port_list",
+            description=(
+                "List listening TCP/UDP ports and the owning process. Read-only."
+            ),
+            parameters=object_schema(
+                {"port": {"type": "string", "description": "Optional specific port"}},
+                [],
+            ),
+            handler=port_list,
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="service_status",
+            description="Inspect a system service's status (read-only).",
+            parameters=object_schema(
+                {"service": {"type": "string", "description": "Service name"}},
+                ["service"],
+            ),
+            required_keys=["service"],
+            handler=service_status,
+            capabilities=("exec",),
+        ),
+        Tool(
+            name="service_restart",
+            description=(
+                "Restart a system service. Destructive (T4) — requires approval."
+            ),
+            parameters=object_schema(
+                {"service": {"type": "string", "description": "Service name"}},
+                ["service"],
+            ),
+            required_keys=["service"],
+            handler=service_restart,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="high",
+            requires_approval=True,
+            capabilities=("exec",),
         ),
     ] + _clone_tools()
 
@@ -577,10 +1131,10 @@ def _clone_tools() -> list[Tool]:
     approval-gated; read-only listings are free.
     """
     from modus.tools.git_tools import (
-        git_branch_checkout, git_branch_create, git_branch_list,
+        git_blame, git_branch_checkout, git_branch_create, git_branch_list,
         git_branch_merge, git_clone, git_credential_clear,
-        git_credential_set, git_fetch, git_pull, git_push,
-        git_remote_add, git_remote_list, git_remote_remove,
+        git_credential_set, git_fetch, git_log, git_pull, git_push,
+        git_remote_add, git_remote_list, git_remote_remove, git_show,
     )
 
     def _schema(props, required):
@@ -606,11 +1160,16 @@ def _clone_tools() -> list[Tool]:
                 "git_branch_merge": git_branch_merge,
                 "git_credential_set": git_credential_set,
                 "git_credential_clear": git_credential_clear,
+                "git_log": git_log,
+                "git_show": git_show,
+                "git_blame": git_blame,
             }[name],
             is_read_only=read_only,
             is_concurrency_safe=False,
             danger_level="safe" if read_only else ("high" if high else "medium"),
             requires_approval=not read_only,
+            # git shelled out + host network + (for writes) workspace mutation
+            capabilities=("filesystem", "exec", "network"),
         )
 
     return [
@@ -659,6 +1218,20 @@ def _clone_tools() -> list[Tool]:
         _tool("git_credential_clear", "Remove stored git credentials for a remote.",
               {"remote": {"type": "string", "description": "Remote name or URL"}},
               ["remote"], high=True),
+        # Read-only history tools: recent commits, one commit's diff, and
+        # per-line attribution.  Local-only (no network), bounded output.
+        _tool("git_log", "List recent commits (oneline + decoration).",
+              {"count": {"type": "number", "description": "Max commits (default 20)"},
+               "path": {"type": "string", "description": "Restrict to a path"}},
+              [], read_only=True),
+        _tool("git_show", "Show one commit's message, files and bounded diff.",
+              {"rev": {"type": "string", "description": "Commit hash or ref"},
+               "stat": {"type": "string", "description": "'stat' for a compact stat-only view"}},
+              ["rev"], read_only=True),
+        _tool("git_blame", "Per-line attribution for a file (who/when changed each line).",
+              {"path": {"type": "string", "description": "File path"},
+               "rev": {"type": "string", "description": "Optional revision"}},
+              ["path"], read_only=True),
     ]
 
 async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -681,23 +1254,89 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
         limit = max(1, min(int(payload.get("limit") or 100), 1000))
         use_regex = bool(payload.get("regex", False))
         case_sensitive = bool(payload.get("case_sensitive", False))
+        word_boundary = bool(payload.get("word_boundary", False))
         context_lines = max(0, min(int(payload.get("context_lines") or 0), 3))
         try:
             compiled = re.compile(query, 0 if case_sensitive else re.IGNORECASE) if use_regex else None
         except re.error as exc:
             return ToolResult(f"invalid regex: {exc}", is_error=True)
+        # Exact-symbol mode: only match whole words/identifiers, so ``find_me``
+        # does not hit ``find_me_again`` and ``user`` does not hit ``User``.
+        # For a literal query this becomes a word-boundary regex; a regex query
+        # with word_boundary is wrapped with the same identifier fences.
+        if word_boundary:
+            if use_regex:
+                try:
+                    compiled = re.compile(
+                        rf"(?<!\w)(?:{query})(?!\w)",
+                        0 if case_sensitive else re.IGNORECASE,
+                    )
+                except re.error as exc:
+                    return ToolResult(f"invalid regex: {exc}", is_error=True)
+            else:
+                escaped = re.escape(query)
+                compiled = re.compile(
+                    rf"(?<!\w){escaped}(?!\w)",
+                    0 if case_sensitive else re.IGNORECASE,
+                )
 
         root = Path(context.workspace_root or context.cwd).resolve()
-        files = [start] if start.is_file() else sorted(
-            (item for item in start.rglob("*") if item.is_file()),
-            key=lambda item: str(item),
-        )
-        guard = PathGuard()
         matches: list[str] = []
-        for candidate in files:
-            resolved = guard.validate(candidate)
-            if _skip_file(resolved):
-                continue
+        truncated = {"hit": False}
+
+        def _mark_truncated() -> None:
+            truncated["hit"] = True
+
+        # Indexed fast path: when ``use_index`` is set and a persisted index
+        # exists for this root, narrow candidates to indexed lines instead of
+        # re-walking the filesystem.  Falls back to the scan when no index
+        # exists (and reports that the result was scan-based).
+        use_index = bool(payload.get("use_index", False))
+        index_hit = False
+        if use_index and not start.is_file():
+            from modus.tools.code_index import CodeIndex
+
+            from modus.paths import data_dir
+
+            idx = CodeIndex(root, data_dir() / "code_index")
+            if idx.exists():
+                index_hit = True
+                candidates = idx.query(
+                    path_prefix=str(start.relative_to(root)) if start != root else "",
+                    limit=500_000,
+                )
+
+                def _match(line: str) -> bool:
+                    return bool(compiled.search(line)) if compiled else (
+                        query in line if case_sensitive else query.casefold() in line.casefold()
+                    )
+
+                for row in candidates:
+                    if not _match(row.content):
+                        continue
+                    relative = row.path
+                    if context_lines == 0:
+                        matches.append(f"{relative}:{row.line}: {row.content.strip()}")
+                    else:
+                        matches.append(f"{relative}:{row.line}:\n{row.content}")
+                    if len(matches) >= limit:
+                        return ToolResult(
+                            "\n".join(matches) + f"\n... [limited to {limit} matches]"
+                        )
+                if not matches:
+                    return ToolResult("(no matches)")
+                return ToolResult("\n".join(matches))
+
+        async def _all_candidates():
+            if start.is_file():
+                yield start
+            else:
+                async for path in _iter_bounded_files(
+                    start, _scan_cap(context), on_truncate=_mark_truncated,
+                ):
+                    yield path
+
+        async for resolved in _all_candidates():
             try:
                 lines = resolved.read_text(encoding="utf-8").splitlines()
             except (OSError, UnicodeDecodeError):
@@ -719,9 +1358,39 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
                     matches.append(f"{relative}:{line_number}: {line.strip()}")
                 if len(matches) >= limit:
                     return ToolResult("\n".join(matches) + f"\n... [limited to {limit} matches]")
-        return ToolResult("\n".join(matches) or "(no matches)")
+        if truncated["hit"]:
+            cap = _scan_cap(context)
+            footer = f"\n... [扫描达上限 {cap} 文件，结果不完整]"
+        else:
+            footer = ""
+        return ToolResult("\n".join(matches) + footer if matches else (f"(no matches){footer}"))
     except PathPolicyError as exc:
         return _path_error(exc)
+
+
+async def rebuild_code_index(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    """Build or refresh the persistent code-search index for the workspace."""
+    from modus.tools.code_index import CodeIndex
+
+    from modus.paths import data_dir
+
+    root = Path(context.workspace_root or context.cwd).resolve()
+    idx = CodeIndex(root, data_dir() / "code_index")
+
+    async def _walker():
+        async for path in _iter_bounded_files(root, _scan_cap(context)):
+            yield path
+
+    paths = [p async for p in _walker()]
+    try:
+        lines = idx.rebuild(paths, cap=_scan_cap(context))
+    except Exception as exc:
+        return ToolResult(f"rebuild_code_index failed: {exc}", is_error=True)
+    stats = idx.stats()
+    return ToolResult(
+        f"Indexed {stats['files']} files, {lines} lines for {root}",
+        metadata={"operation": "rebuild_code_index", "files": stats["files"], "lines": lines},
+    )
 
 async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
     """Load a user skill prompt from the non-executable local skill repository."""
@@ -747,38 +1416,32 @@ async def bash(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         cwd=context.cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
+        env=_safe_shell_env(),
         preexec_fn=rlimit_preexec(context.config),
         **_process_group_kwargs(),
     )
-    communicate_task = asyncio.create_task(proc.communicate())
-    cancel_task = (
-        asyncio.create_task(context.cancel_event.wait())
-        if context.cancel_event is not None else None
-    )
-    waiters = {communicate_task, *([cancel_task] if cancel_task is not None else [])}
+    cancelled = False
     try:
-        done, _pending = await asyncio.wait(
-            waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        stdout, stderr, truncated, timed_out = await _capture_stream_output(
+            proc, context.cancel_event, timeout,
         )
-        if communicate_task in done:
-            stdout, stderr = communicate_task.result()
-        else:
-            cancelled = cancel_task is not None and cancel_task in done
-            stdout, stderr = await _stop_process_group(proc, communicate_task)
-            if cancelled:
-                return ToolResult("Command cancelled.", is_error=True)
+        if context.cancel_event is not None and context.cancel_event.is_set():
+            cancelled = True
+        elif truncated:
+            return ToolResult(
+                "Command output exceeded the cap and was terminated.",
+                is_error=True,
+                disclosure={"output_capped": True},
+            )
+        elif timed_out:
             return ToolResult(f"Command timed out after {timeout:.0f}s", is_error=True)
     except asyncio.CancelledError:
         # ``Tool.execute`` may cancel a handler on its own I/O deadline.  That
         # must have the same process-tree cleanup guarantee as a run cancel.
-        await _stop_process_group(proc, communicate_task)
+        _terminate_process_group(proc)
         raise
-    finally:
-        if cancel_task is not None and not cancel_task.done():
-            cancel_task.cancel()
-        if cancel_task is not None:
-            await asyncio.gather(cancel_task, return_exceptions=True)
+    if cancelled:
+        return ToolResult("Command cancelled.", is_error=True)
     output = (stdout + stderr).decode("utf-8", errors="replace")
     full_output = output
     # Keep the legacy visible ``content`` (hard 20k cut) so existing consumers
@@ -884,31 +1547,29 @@ async def run_tests(payload: dict[str, Any], context: ToolContext) -> ToolResult
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
+        env=_safe_shell_env(),
         preexec_fn=rlimit_preexec(context.config),
         **_process_group_kwargs(),
     )
-    communicate_task = asyncio.create_task(proc.communicate())
     cancel_task = (
         asyncio.create_task(context.cancel_event.wait())
         if context.cancel_event is not None else None
     )
-    waiters = {communicate_task, *([cancel_task] if cancel_task is not None else [])}
     status = "failed"
-    timed_out = False
-    cancelled = False
     try:
-        done, _pending = await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        if communicate_task in done:
-            stdout, stderr = communicate_task.result()
+        stdout, stderr, truncated, timed_out = await _capture_stream_output(
+            proc, context.cancel_event, timeout,
+        )
+        if context.cancel_event is not None and context.cancel_event.is_set():
+            status = "cancelled"
+        elif truncated:
+            status = "failed"
+        elif timed_out:
+            status = "timed_out"
         else:
-            cancelled = cancel_task is not None and cancel_task in done
-            timed_out = not cancelled
-            _terminate_process_group(proc)
-            stdout, stderr = await communicate_task
-        status = "cancelled" if cancelled else "timed_out" if timed_out else "passed" if proc.returncode == 0 else "failed"
+            status = "passed" if proc.returncode == 0 else "failed"
     except asyncio.CancelledError:
-        await _stop_process_group(proc, communicate_task)
+        _terminate_process_group(proc)
         raise
     finally:
         if cancel_task is not None and not cancel_task.done():
@@ -1001,6 +1662,75 @@ def _process_group_kwargs() -> dict[str, Any]:
     if os.name == "nt":
         return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
     return {"start_new_session": True}
+
+
+async def _capture_stream_output(
+    proc: asyncio.subprocess.Process, cancel_event: asyncio.Event | None,
+    timeout: float,
+    cap: int = _STREAM_OUTPUT_CAP,
+) -> tuple[bytes, bytes, bool]:
+    """Capture stdout+stderr incrementally, killing the tree on overflow.
+
+    Unlike ``proc.communicate()`` (which buffers everything until exit, so a
+    streaming command can OOM the process), this reads in chunks and stops the
+    moment the combined output exceeds ``cap``, killing the process group and
+    marking the result truncated.  Returns (stdout, stderr, truncated, timed_out).
+    """
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    total = 0
+    truncated = False
+
+    async def drain(reader: asyncio.StreamReader | None, sink: list[bytes]) -> bool:
+        nonlocal total, truncated
+        if reader is None:
+            return True
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                return True
+            total += len(chunk)
+            if total > cap:
+                truncated = True
+                return False
+            sink.append(chunk)
+
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    drain_task = asyncio.gather(
+        drain(stdout_stream, stdout_chunks),
+        drain(stderr_stream, stderr_chunks),
+        return_exceptions=True,
+    )
+    cancel_task = (
+        asyncio.create_task(cancel_event.wait())
+        if cancel_event is not None else None
+    )
+    waiters = {drain_task, *([cancel_task] if cancel_task is not None else [])}
+    try:
+        done, _pending = await asyncio.wait(
+            waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        if cancel_task is not None and not cancel_task.done():
+            cancel_task.cancel()
+        if cancel_task is not None:
+            await asyncio.gather(cancel_task, return_exceptions=True)
+    # Either the streams ended cleanly, the timeout fired, or we hit the cap.
+    timed_out = False
+    cancelled = cancel_task is not None and cancel_task in done
+    if truncated or cancelled or drain_task not in done or getattr(proc, "returncode", None) is None:
+        if drain_task not in done:
+            drain_task.cancel()
+            await asyncio.gather(drain_task, return_exceptions=True)
+        if not truncated and not cancelled:
+            timed_out = True
+        _terminate_process_group(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (TimeoutError, ProcessLookupError):
+            pass
+    return b"".join(stdout_chunks), b"".join(stderr_chunks), truncated, timed_out
 
 
 async def _stop_process_group(

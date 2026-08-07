@@ -19,7 +19,7 @@ VERIFICATION_SCHEMA = "modus.verification.v1"
 _TOOL_RESULTS = frozenset({"tool_result", "subagent_tool_result"})
 _TERMINAL_TYPES = frozenset({"run_completed", "run_error"})
 _MUTATION_TOOLS = frozenset({"write_file", "edit_file", "patch"})
-_BUDGET_STOPS = frozenset({"max_turns", "token_limit", "wall_time"})
+_BUDGET_STOPS = frozenset({"max_turns", "token_limit", "wall_time", "no_progress"})
 _VERIFICATION_STOPS = frozenset({"verification_required", "verification_retry_limit"})
 
 # Tool name -> short human action label for the activity feed.
@@ -148,6 +148,19 @@ def project_semantic_run(
         "activities": activities,
         "evidence": evidence,
         "recoveries": recoveries,
+        "retrospective": _retrospective(
+            outcome=outcome, phases=_phases(activities), evidence=evidence,
+            metrics={
+                "duration_seconds": _number(budget.get("elapsed_seconds")),
+                "turns": _integer(
+                    terminal_payload.get("total_turns", budget.get("turns"))
+                ),
+                "tokens": _integer(
+                    terminal_payload.get("total_tokens", budget.get("total_tokens"))
+                ),
+            },
+            turn_records=budget.get("turn_records") or [],
+        ),
         "task_ids": [
             str(item.get("task_id")) for item in task_rows if item.get("task_id")
         ],
@@ -169,6 +182,50 @@ def project_semantic_run(
         "source_event_ids": [
             str(event.get("event_id")) for event in ordered if event.get("event_id")
         ],
+    }
+
+
+def _retrospective(
+    *, outcome: dict[str, Any], phases: list[dict[str, Any]],
+    evidence: list[dict[str, Any]], metrics: dict[str, Any],
+    turn_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive a deterministic run retrospective from existing projections.
+
+    Summarizes how the run ended and why, for post-run review.  Purely derived
+    from already-computed fields and the terminal budget's turn_records — no new
+    events, no model calls.
+    """
+    stop_reason = str(outcome.get("stop_reason") or outcome.get("status") or "")
+    verification_status = str(outcome.get("confidence") or "unverified")
+    evidence_count = len(evidence)
+    passing = sum(1 for item in evidence if item.get("status") == "passed")
+    phase_summary = [
+        {"kind": phase.get("kind"), "count": phase.get("count", 0)}
+        for phase in phases
+    ]
+    turn_strip = [
+        {
+            "turn": record.get("turn"),
+            "text_chars": record.get("text_chars", 0),
+            "tool_calls": record.get("tool_calls", 0),
+            "tool_successes": record.get("tool_successes", 0),
+            "tool_errors": record.get("tool_errors", 0),
+        }
+        for record in (turn_records or [])[-50:]
+    ]
+    return {
+        "stop_reason": stop_reason,
+        "verification": verification_status,
+        "evidence_attempts": evidence_count,
+        "evidence_passed": passing,
+        "phases": phase_summary,
+        "turn_strip": turn_strip,
+        "metrics": {
+            "duration_seconds": _number(metrics.get("duration_seconds")),
+            "turns": _integer(metrics.get("turns")),
+            "tokens": _integer(metrics.get("tokens")),
+        },
     }
 
 

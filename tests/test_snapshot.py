@@ -118,3 +118,21 @@ async def test_executor_snapshot_then_revert_turn_restores(tmp_path, monkeypatch
     result = await revert_turn({"action": "restore"}, ctx)
     assert not result.is_error
     assert (workspace / "file.txt").read_text(encoding="utf-8") == "original\n"
+
+
+def test_snapshot_commit_id_is_real_hash_and_restores(tmp_path, monkeypatch):
+    """commit_id must be the git hash (not commit stdout), and restore works."""
+    repo = _repo(tmp_path)
+    monkeypatch.setattr("modus.paths.data_dir", lambda env=None: tmp_path / "modus-data")
+
+    snap = create_snapshot(str(repo), phase="pre-turn", summary="baseline")
+
+    # commit_id is a 40-char SHA-1 hex hash, not the commit summary line.
+    assert snap is not None
+    assert len(snap.commit_id) == 40
+    assert all(c in "0123456789abcdef" for c in snap.commit_id)
+
+    # Mutate, then restore using the recorded hash; the file must revert.
+    (repo / "file.txt").write_text("MUTATED\n", encoding="utf-8")
+    restored, removed = restore_snapshot(str(repo), snap.commit_id)
+    assert (repo / "file.txt").read_text(encoding="utf-8") == "v1\n"

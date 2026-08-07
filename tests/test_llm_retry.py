@@ -80,3 +80,34 @@ async def test_retry_respects_wall_time_budget():
     # Backoff (0.5s+) exceeds the 0.05s budget, so only the first attempt runs.
     assert calls["count"] == 1
     assert any(ev["type"] == "error" for ev in events)
+
+
+def test_recovery_policy_maps_each_reason():
+    from modus.llm.errors import (
+        FailoverReason, RecoveryAction, recovery_policy,
+    )
+    assert recovery_policy(FailoverReason.rate_limit) is RecoveryAction.RETRY_WITH_BACKOFF
+    assert recovery_policy(FailoverReason.server_error) is RecoveryAction.RETRY_WITH_BACKOFF
+    assert recovery_policy(FailoverReason.timeout) is RecoveryAction.RETRY_WITH_BACKOFF
+    assert recovery_policy(FailoverReason.context_overflow) is RecoveryAction.FORCE_COMPACT_AND_RETRY
+    assert recovery_policy(FailoverReason.auth) is RecoveryAction.SURFACE_TYPED
+    assert recovery_policy(FailoverReason.billing) is RecoveryAction.SURFACE_TYPED
+    assert recovery_policy(FailoverReason.model_not_found) is RecoveryAction.SURFACE_TYPED
+    # Unknown fails closed.
+    assert recovery_policy(FailoverReason.unknown) is RecoveryAction.FAIL_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_error_is_not_retried():
+    """A 401 (auth) error is surfaced immediately, not retried."""
+    calls = {"count": 0}
+
+    async def chat(messages, tools, *, system_prompt):
+        calls["count"] += 1
+        yield {"type": "error", "error": "API 401: invalid api key"}
+
+    wrapped = retry_chat(chat, max_attempts=3)
+    events = await _collect(wrapped([], [], system_prompt="sys"))
+
+    assert calls["count"] == 1  # never retried
+    assert any(ev["type"] == "error" for ev in events)

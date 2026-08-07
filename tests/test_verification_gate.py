@@ -97,7 +97,9 @@ async def test_query_stops_after_verification_retry_limit():
             self.calls += 1
             tool_messages = [item for item in messages if item.role == "tool"]
             last = str(tool_messages[-1].content) if tool_messages else ""
-            if not tool_messages or last.startswith("{\"schema\":"):
+            # Edit ONCE, then keep running failing tests (real edit->test->fix:
+            # a model changes code, then tests repeatedly).
+            if not tool_messages:
                 name, args = "edit_file", '{"path":"app.py"}'
             else:
                 name, args = "run_tests", '{"command":"false"}'
@@ -141,3 +143,31 @@ async def test_query_stops_after_verification_retry_limit():
     assert events[-1]["stop_reason"] == "verification_retry_limit"
     assert events[-1]["verification"]["attempts"] == 2
     assert events[-1]["verification"]["retry_exhausted"] is True
+
+
+def test_pre_edit_failures_do_not_exhaust_post_edit_budget():
+    """Investigation failures before an edit must not kill the post-edit loop."""
+    from modus.runtime.verification import RunVerification
+
+    v = RunVerification(max_attempts=2)
+    # Investigate: two failing probes BEFORE any edit.
+    v.observe_tool(name="run_tests", payload={"command": "false"},
+                   result='{"schema":"modus.verification.v1","status":"failed"}', is_error=True)
+    v.observe_tool(name="run_tests", payload={"command": "false"},
+                   result='{"schema":"modus.verification.v1","status":"failed"}', is_error=True)
+    assert v.snapshot()["retry_exhausted"] is False  # no mutation yet
+
+    # Now the edit lands; the attempt budget resets.
+    v.observe_tool(name="edit_file", payload={"path": "app.py"},
+                   result="Edited app.py: replaced 1 exact match.", is_error=False)
+    assert v.attempts == 0
+
+    # One post-edit failure is NOT exhausted (budget is 2, per-mutation).
+    v.observe_tool(name="run_tests", payload={"command": "false"},
+                   result='{"schema":"modus.verification.v1","status":"failed"}', is_error=True)
+    assert v.snapshot()["retry_exhausted"] is False
+
+    # A second post-edit failure exhausts the budget.
+    v.observe_tool(name="run_tests", payload={"command": "false"},
+                   result='{"schema":"modus.verification.v1","status":"failed"}', is_error=True)
+    assert v.snapshot()["retry_exhausted"] is True

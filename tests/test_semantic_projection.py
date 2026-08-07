@@ -360,3 +360,28 @@ def test_activities_reject_missing_actor_with_host_fallback() -> None:
     semantic = project([completed()])
     # run_completed has no actor in the test helper; activities stay valid.
     assert all(item["actor"] for item in semantic["activities"])
+
+
+def test_retrospective_is_derived_and_bounded():
+    """Retrospective summarizes the run's ending from existing projections."""
+    from modus.desktop.semantic_projection import _retrospective
+
+    retro = _retrospective(
+        outcome={"stop_reason": "max_turns", "status": "incomplete", "confidence": "unverified"},
+        phases=[{"kind": "executing", "count": 5}, {"kind": "verifying", "count": 1}],
+        evidence=[{"status": "failed"}],
+        metrics={"duration_seconds": 10.0, "turns": 6, "tokens": 100},
+        turn_records=[
+            {"turn": i, "text_chars": 0, "tool_calls": 1, "tool_successes": 0, "tool_errors": 1}
+            for i in range(60)  # more than 50 -> capped
+        ],
+    )
+
+    assert retro["stop_reason"] == "max_turns"
+    assert retro["verification"] == "unverified"
+    assert retro["evidence_attempts"] == 1
+    assert retro["evidence_passed"] == 0
+    # Turn strip is bounded to the newest 50.
+    assert len(retro["turn_strip"]) == 50
+    assert retro["turn_strip"][-1]["turn"] == 59
+    assert retro["metrics"]["tokens"] == 100

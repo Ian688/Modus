@@ -62,6 +62,9 @@ class ReActReasoner:
         model context never exceeds the configured threshold mid-run.  The
         compaction summary is a reference-only system message; tail messages
         are kept by reference so identity-based persistence still works.
+        (End-of-run compaction in the desktop runner applies semantic
+        summarization when enabled; mid-run stays deterministic so the hot loop
+        never blocks on a model call.)
         """
         from modus.agent.compressor import (
             compression_tail_count, compress_messages, should_compress,
@@ -81,6 +84,33 @@ class ReActReasoner:
         )
         compacted = compress_messages(messages, summary=summary, tail_count=tail_count)
         messages[:] = compacted
+
+    def _maybe_adapt(self, messages: list[Message], budget: Any) -> None:
+        """Bounded self-adaptive nudge from turn_records trends (opt-in).
+
+        Gated on ``config.features.self_adapt`` (default off).  When a recent
+        window shows a tool-error hotspot, inject ONE reference-only hint so the
+        model reconsiders its tool strategy.  The hint is a plain user message
+        under an explicit marker — never a new event type, never a strategy
+        switch mid-run.
+        """
+        if not bool(getattr(self.config.features, "self_adapt", False)):
+            return
+        try:
+            trends = budget.trends(window=5)
+            if trends.get("tool_error_hotspot"):
+                messages.append(Message(
+                    role="user",
+                    content=(
+                        "[SELF-ADAPT — REFERENCE ONLY]\n"
+                        "Recent turns show repeated tool failures. Consider "
+                        "verifying the exact tool inputs, checking the file or "
+                        "command exists, or trying a different approach before "
+                        "retrying the same call."
+                    ),
+                ))
+        except Exception:
+            return
 
     def _inject_python_diagnostics(
         self, messages: list[Message], paths: list[str],
@@ -175,6 +205,9 @@ class ReActReasoner:
         context = ToolContext(
             cwd=self.cwd, config=self.config, approval_callback=approval_callback,
             cancel_event=cancel_event, session_id=self.session_id, run_id=self.run_id,
+            granted_capabilities=(
+                getattr(getattr(self.config, "policy", None), "capability_grant", None)
+            ),
         )
 
         terminal_reason = StopReason.MAX_TURNS
@@ -189,6 +222,27 @@ class ReActReasoner:
             except BudgetExceeded as exc:
                 terminal_reason = exc.reason
                 break
+            # Self-aware stall detection: if the last N turns all made no
+            # progress (no text, no thinking, no tool attempt), stop before
+            # burning the remaining budget on an agent that is spinning.  A run
+            # holding unverified file mutations is never stalled: the
+            # verification loop owns its termination.
+            stall_threshold = int(getattr(self.config.runtime, "no_progress_threshold", 0) or 0)
+            verification_required = bool(
+                budget.verification.snapshot().get("required", False)
+            )
+            if (
+                stall_threshold > 0
+                and not verification_required
+                and budget.stalled_for(stall_threshold)
+            ):
+                terminal_reason = StopReason.NO_PROGRESS
+                budget.finish(StopReason.NO_PROGRESS)
+                break
+            # Self-adaptive loop: when enabled, read turn_records trends and
+            # inject a bounded corrective hint (never loops, never changes
+            # strategy mid-run — only nudges with a reference-only message).
+            self._maybe_adapt(messages, budget)
             # Mid-run deterministic compaction: a long run must never silently
             # lose its own middle at the provider wire.  Compact the in-loop
             # message list before the model call when it crosses the configured
@@ -198,6 +252,9 @@ class ReActReasoner:
             # that persist by object identity can still tell new turns apart.
             self._maybe_compact_mid_run(messages)
             text = ""
+            thinking_chars = 0
+            error_retried = False
+            skip_turn_finalize = False
             stop_reason = "end_turn"
             usage_input = 0
             usage_output = 0
@@ -245,7 +302,9 @@ class ReActReasoner:
                     text += delta
                     yield {"type": "text_delta", "text": delta}
                 elif event_type == "thinking_delta":
-                    yield {"type": "thinking_delta", "thinking": event.get("thinking")}
+                    thinking = str(event.get("thinking") or "")
+                    thinking_chars += len(thinking)
+                    yield {"type": "thinking_delta", "thinking": thinking}
                 elif event_type == "tool_call_delta":
                     _merge_tool_delta(tool_states, event["tool_call"])
                 elif event_type == "message_end":
@@ -256,13 +315,31 @@ class ReActReasoner:
                     usage_output += int(usage.get("output_tokens") or 0)
                 elif event_type == "error":
                     detail = str(event.get("error") or "Unknown model error")
+                    failover = str(event.get("failover") or _classify_failover_reason(detail))
                     budget.record_usage(usage_input, usage_output, owner="host:react")
+                    # Error-classification-driven behavior: a context-overflow
+                    # failure with zero output self-heals by compacting and
+                    # re-entering the turn once, instead of failing the run.
+                    if not error_retried and not text and not tool_states:
+                        if _classify_recovery_action(failover) == "force_compact":
+                            self._maybe_compact_mid_run(messages)
+                            error_retried = True
+                            skip_turn_finalize = True
+                            break
                     terminal_reason = budget.finish(StopReason.ENGINE_ERROR)
                     yield {
                         "type": "error", "error": detail,
+                        "failover": failover,
                         "stop_reason": terminal_reason.value, "budget": budget.snapshot(),
                     }
                     return
+
+            if skip_turn_finalize:
+                # A self-healed context-overflow turn produced no output; skip
+                # the normal turn-finalize (which would read an empty turn as
+                # COMPLETED) and re-enter the loop to retry once.
+                skip_turn_finalize = False
+                continue
 
             budget.record_usage(usage_input, usage_output, owner="host:react")
             try:
@@ -286,13 +363,21 @@ class ReActReasoner:
 
             tool_results = await executor.execute_all(tool_calls, context)
             edited_paths: list[str] = []
+            tool_successes = 0
+            tool_errors = 0
+            result_chars = 0
             for result in tool_results:
                 tool_name = _tool_name_by_id(tool_calls, result.tool_use_id or "")
                 tool_payload = _tool_input_by_id(tool_calls, result.tool_use_id or "")
                 model_text = result.model_text()
+                result_chars += len(model_text)
                 budget.verification.observe_tool(
                     name=tool_name, payload=tool_payload, result=model_text, is_error=result.is_error,
                 )
+                if result.is_error:
+                    tool_errors += 1
+                else:
+                    tool_successes += 1
                 event = {
                     "type": "tool_result", "tool_call_id": str(result.tool_use_id or ""),
                     "name": tool_name,
@@ -310,6 +395,15 @@ class ReActReasoner:
             # and reference-only; a failure never breaks the loop.
             if edited_paths and bool(getattr(self.config.features, "lsp_diagnostics", True)):
                 self._inject_python_diagnostics(messages, edited_paths)
+            # Self-observation: record this turn's outcome for stall detection.
+            # thinking_chars credits reasoning turns; result_chars credits
+            # informative tool output (failing tests/probes) as activity.
+            budget.record_turn(
+                turn=turn, text_chars=len(text), thinking_chars=thinking_chars,
+                tool_calls=len(tool_calls), tool_successes=tool_successes,
+                tool_errors=tool_errors, result_chars=result_chars,
+                tokens=usage_input + usage_output, stop_reason=stop_reason,
+            )
             verification_after_tools = budget.verification.snapshot()
             if verification_after_tools["retry_exhausted"]:
                 terminal_reason = StopReason.VERIFICATION_RETRY_LIMIT
@@ -333,3 +427,39 @@ class ReActReasoner:
             "stop_reason": terminal_reason.value, "budget": budget_snapshot,
             "verification": verification,
         }
+
+
+def _classify_recovery_action(failover_reason: str) -> str:
+    """Return a loop-level recovery action for a classified failover reason.
+
+    One of ``force_compact`` (context overflow, self-heal by compacting),
+    ``retry_backoff`` (transient, handled inside retry_chat), or ``fail``
+    (terminal).  The reasoner only acts on ``force_compact`` here; the other
+    transient cases are already covered by retry_chat's classifier.
+    """
+    from modus.llm.errors import (
+        FailoverReason, RecoveryAction, recovery_policy,
+    )
+    try:
+        reason = FailoverReason(failover_reason)
+    except ValueError:
+        return "fail"
+    action = recovery_policy(reason)
+    if action is RecoveryAction.FORCE_COMPACT_AND_RETRY:
+        return "force_compact"
+    if action is RecoveryAction.RETRY_WITH_BACKOFF:
+        return "retry_backoff"
+    return "fail"
+
+
+def _classify_failover_reason(detail: str) -> str:
+    """Return a machine-readable failover reason for the terminal error event."""
+    from modus.llm.errors import classify_api_error
+    status = 0
+    prefix = "api "
+    if detail.lower().startswith(prefix):
+        try:
+            status = int(detail[len(prefix): detail.index(":")])
+        except (ValueError, IndexError):
+            status = 0
+    return classify_api_error(RuntimeError(detail), status).reason.value

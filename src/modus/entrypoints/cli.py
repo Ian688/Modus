@@ -69,6 +69,7 @@ async def _cli_approval_callback(request: dict) -> str:
         f"[bold]{tool_name}[/bold] 请求执行",
         f"危险级别: [{style}]{danger}[/{style}]",
         f"数据披露: {request.get('data_disclosure') or 'none'}",
+        f"影响: {request.get('impact_class') or 'undetermined'}",
     ]
     if request.get("description"):
         lines.append(f"描述: {request['description']}")
@@ -85,17 +86,44 @@ async def _cli_approval_callback(request: dict) -> str:
     )
     decision = answer.strip().lower()
     if decision == "y":
+        _record_cli_audit("approved", request, "y")
         return "approve"
     if decision == "s":
+        _record_cli_audit("skipped", request, "s")
         return "skip"
     if decision == "m":
         modified = _prompt_modified_args(request.get("input") or {})
         if modified is not None:
             from modus.tools.base import ApprovalResponse
 
+            _record_cli_audit("modified", request, "m")
             return ApprovalResponse.modify(modified)
+        _record_cli_audit("denied", request, "m-invalid")
         return "deny"  # failed to produce a valid modification
+    _record_cli_audit("denied", request, "n")
     return "deny"
+
+
+def _record_cli_audit(outcome: str, request: dict, detail: str) -> None:
+    """Best-effort audit of a CLI approval decision into the policy audit log.
+
+    Never raises: audit is a diagnostic trail, not a gate.
+    """
+    try:
+        from modus.policy.audit_log import AuditLog
+
+        config = load_config()
+        log = AuditLog(config.policy.audit_log_path)
+        log.record(
+            tool_name=str(request.get("tool_name") or "?"),
+            input_data=dict(request.get("input") or {}),
+            outcome=f"{outcome}:{detail}",
+            approver="cli-human",
+            cwd=str(request.get("cwd") or ""),
+            phase=str(request.get("impact_class") or "execution"),
+        )
+    except Exception:
+        return
 
 
 def _prompt_modified_args(original: dict) -> dict | None:
@@ -211,6 +239,71 @@ def memory_cmd(
         raise typer.Exit(2)
 
 
+@app.command("audit")
+def audit_cmd(
+    tail: Annotated[int, typer.Option("--tail", help="Number of recent entries")] = 20,
+    tool: Annotated[str | None, typer.Option("--tool", help="Filter by tool name")] = None,
+    cwd: Annotated[Path | None, typer.Option("--cwd")] = None,
+) -> None:
+    """Show recent redacted audit entries (approvals, tool executions)."""
+    from modus.policy.audit_log import AuditLog
+
+    root = (cwd or Path.cwd()).resolve()
+    config = load_config(project_root=root)
+    log = AuditLog(config.policy.audit_log_path)
+    events = log.tail(max(1, min(int(tail), 500)))
+    if tool:
+        events = [event for event in events if str(event.get("tool_name") or "") == tool]
+    if not events:
+        typer.echo("（无审计记录）")
+        return
+    for event in events:
+        timestamp = str(event.get("timestamp") or "")[:19]
+        name = str(event.get("tool_name") or "?")
+        outcome = str(event.get("outcome") or "?")
+        approver = str(event.get("approver") or "?")
+        input_preview = str(event.get("input") or "{}")
+        if len(input_preview) > 120:
+            input_preview = input_preview[:117] + "..."
+        typer.echo(f"{timestamp}  {name}  {outcome}  (approver={approver})  {input_preview}")
+
+
+@app.command("mcp")
+def mcp_cmd(
+    serve: Annotated[bool, typer.Option("--serve", help="Run the MCP server")] = True,
+    cwd: Annotated[Path | None, typer.Option("--cwd", help="Working directory")] = None,
+    allow_dangerous: Annotated[
+        bool, typer.Option("--allow-dangerous",
+                           help="Expose write/exec tools (bash, spawn, git writes) — default denies them")] = False,
+    capabilities: Annotated[
+        str | None, typer.Option("--capabilities",
+                                 help="Comma-separated capability whitelist (filesystem,network,...)")] = None,
+    transport: Annotated[
+        str, typer.Option("--transport", help="stdio (default) or http")] = "stdio",
+    host: Annotated[str, typer.Option("--host", help="HTTP bind host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="HTTP port")] = 4000,
+) -> None:
+    """Expose Modus's built-in tools to other AI agents as an MCP server.
+
+    Defaults to a read-only lens (safe + read-only tools only).  Add
+    --allow-dangerous to expose write/exec tools; even then a headless call to
+    a write tool is denied (approval never auto-grants).
+    """
+    root = (cwd or Path.cwd()).resolve()
+    from modus.mcp_server import mcp_serve, mcp_serve_http
+
+    cap_list = [c.strip() for c in (capabilities or "").split(",") if c.strip()] or None
+    if transport == "http":
+        mcp_serve_http(
+            cwd=str(root), allow_dangerous=allow_dangerous,
+            capabilities=cap_list, host=host, port=port,
+        )
+    else:
+        mcp_serve(
+            cwd=str(root), allow_dangerous=allow_dangerous, capabilities=cap_list,
+        )
+
+
 def _data_dir() -> Path:
     env = __import__("os").environ.get("MODUS_DATA_DIR")
     if env:
@@ -227,6 +320,37 @@ def _active_session(db_module: Any) -> str:
     return str(db_module.create_session("cli")["id"])
 
 
+def _repl_session() -> tuple[Any, str]:
+    """Initialize the CLI's own persistent database and return (db, session_id).
+
+    Uses a dedicated ``~/.modus`` data dir shared with the Desktop, but the CLI
+    session is tagged ``cli`` so it never collides with Desktop sessions.  The
+    DB is only touched when memory/recall is actually wanted, so a plain REPL
+    run without persisted state costs nothing.
+    """
+    from modus.desktop import db
+
+    data_dir = _data_dir()
+    db.DB_DIR = data_dir
+    db.DB_PATH = data_dir / "desktop.db"
+    db.init_db()
+    sid = _active_session(db)
+    return db, sid
+
+
+def _memory_message(db_module: Any, session_id: str, query: str) -> Message | None:
+    """Build a bounded memory/recall system message for one CLI turn."""
+    try:
+        from modus.desktop.memory import get_memory_context
+
+        context = get_memory_context(session_id, query=query)
+        if context:
+            return Message(role="system", content=context)
+    except Exception:
+        return None
+    return None
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -240,6 +364,10 @@ def main(
     _ = version
     if ctx.invoked_subcommand is not None:
         return
+    # A normal close (Ctrl-C / exit) reaps background processes this CLI spawned.
+    from modus.process_cleanup import install_process_cleanup
+
+    install_process_cleanup()
     root = (cwd or Path.cwd()).resolve()
     overrides: dict = {}
     if provider or model or plain:
@@ -261,6 +389,8 @@ async def _run_repl(cwd: str, config) -> None:
         config=config,
         cwd=cwd,
     )
+    # Persistent CLI session: injects prior memories/recall and persists turns.
+    db_module, session_id = _repl_session()
     history: list[Message] = []
     console.print(f"[dim]Modus REPL · {cwd} · 输入 exit/quit 退出[/dim]")
     while True:
@@ -274,9 +404,14 @@ async def _run_repl(cwd: str, config) -> None:
             continue
         if text.lower() in {"exit", "quit", "exit()", "quit()"}:
             break
+        # Query-scoped memory + episodic recall as a bounded system message.
+        memory = _memory_message(db_module, session_id, text)
+        turn_history = list(history)
+        if memory is not None:
+            turn_history = [*turn_history, memory]
         try:
             result = await engine.ask_complete_async(
-                text, history=history, approval_callback=_cli_approval_callback,
+                text, history=turn_history, approval_callback=_cli_approval_callback,
             )
         except Exception as exc:
             console.print(f"[red]Error: {exc}[/red]")
@@ -286,6 +421,11 @@ async def _run_repl(cwd: str, config) -> None:
             console.print(f"[dim]· {result.turns} 轮 · {result.total_tokens} tokens[/dim]")
         history.append(Message(role="user", content=text))
         history.append(Message(role="assistant", content=result.text))
+        try:
+            db_module.add_message(session_id, "user", text, token_count=0)
+            db_module.add_message(session_id, "assistant", result.text, token_count=0)
+        except Exception:
+            pass
 
 
 async def _run_prompt(prompt: str, cwd: str, config) -> None:

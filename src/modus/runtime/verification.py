@@ -52,6 +52,11 @@ class RunVerification:
             self.mutation_generation += 1
             path = str(payload.get("path") or payload.get("file_path") or payload.get("file") or "")
             self.mutations.append({"tool": name, "path": path})
+            # A new mutation starts a fresh verification budget.  The attempts
+            # counter is per-mutation-generation, not lifetime: a model that
+            # investigated with several failing probes BEFORE the edit must not
+            # exhaust its post-edit verification allowance.
+            self.attempts = 0
             return
 
         if name != "run_tests":
@@ -60,12 +65,21 @@ class RunVerification:
         try:
             evidence = json.loads(str(result or ""))
         except (TypeError, ValueError):
-            self.last_evidence = {"schema": "modus.verification.v1", "status": "failed"}
+            self.last_evidence = {
+                "schema": "modus.verification.v1", "status": "failed",
+                "mutation_generation": self.mutation_generation,
+            }
             return
         if not isinstance(evidence, dict) or evidence.get("schema") != "modus.verification.v1":
-            self.last_evidence = {"schema": "modus.verification.v1", "status": "failed"}
+            self.last_evidence = {
+                "schema": "modus.verification.v1", "status": "failed",
+                "mutation_generation": self.mutation_generation,
+            }
             return
-        self.last_evidence = evidence
+        self.last_evidence = {
+            **evidence,
+            "mutation_generation": self.mutation_generation,
+        }
         if evidence.get("status") == "passed" and not is_error:
             self.verified_generation = self.mutation_generation
 
@@ -81,12 +95,16 @@ class RunVerification:
             status = "missing"
         else:
             status = "passed"
+        # ``retry_exhausted`` only when the failing evidence postdates the
+        # latest mutation: pre-edit investigation failures belong to an older
+        # generation and must not exhaust the post-edit verification budget.
         retry_exhausted = (
             self.has_mutations
             and required
             and
             self.last_evidence is not None
             and self.last_evidence.get("status") != "passed"
+            and self.last_evidence.get("mutation_generation") == self.mutation_generation
             and self.attempts >= self.max_attempts
         )
         return {
