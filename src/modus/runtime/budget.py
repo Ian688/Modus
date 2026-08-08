@@ -24,6 +24,19 @@ class StopReason(StrEnum):
     # The loop produced no text and no successful tool result for several
     # consecutive turns (self-aware stall detection).
     NO_PROGRESS = "no_progress"
+    # Goal-driven continuation (Wave4 G1): the token budget was exhausted.
+    # This is a *soft* stop — the run injects a summarization prompt instead of
+    # hard-stopping, and the goal survives to be resumed next round.
+    GOAL_BUDGET_LIMITED = "goal_budget_limited"
+    # Goal-driven continuation: the goal's turn budget was exhausted.  Like
+    # GOAL_BUDGET_LIMITED this is soft — ``/goal continue`` resets the counter.
+    GOAL_MAX_TURNS = "goal_max_turns"
+    # Deterministic stall escalation (Wave4 G2): the circuit breaker stayed at
+    # the ``loop`` level across consecutive turns, so the run hands off to a
+    # human with a written diagnostic instead of burning the remaining budget
+    # on the same failing pattern.  This is an *escalation* of the soft
+    # ``[STALL DETECTED]`` hints, not a hard loop break.
+    STALLED = "stalled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +118,13 @@ class RunBudget:
         self.turn_records: list[TurnRecord] = []
         # Optional billing hook (default None keeps CLI/embedder/runner free).
         self._quota_check: Callable[[int, int], bool] | None = None
+        # Stall-scoped accounting (Wave4 G2): tokens spent while the circuit
+        # breaker is at ``watch``/``stall``/``loop`` are counted separately so a
+        # spinning agent is noticed without first burning the whole budget.
+        # ``stall_tokens`` never feeds the authoritative total; it only explains
+        # how much of the run went to a stalled pattern.
+        self.stall_tokens = 0
+        self._stall_tokens_cap = 50_000  # stall tokens per run (deterministic)
 
     @property
     def total_tokens(self) -> int:
@@ -135,6 +155,38 @@ class RunBudget:
             entry = self.usage_ledger.setdefault(owner, {"input_tokens": 0, "output_tokens": 0})
             entry["input_tokens"] += input_tokens
             entry["output_tokens"] += output_tokens
+
+    # ── stall-scoped accounting (Wave4 G2) ────────────────────────────────
+
+    def record_stall_tokens(self, tokens: int, *, owner: str | None = None) -> None:
+        """Count tokens spent on a stalled pattern, separately from the budget.
+
+        Keeps the run's authoritative totals untouched; the stall counter only
+        answers "how much budget went to the repeated failing pattern?".
+        ``owner`` (e.g. ``host:react-stall`` or ``plan:task_X-stall``) lands in
+        the same usage ledger for transparency.
+        """
+        tokens = max(0, int(tokens))
+        if tokens == 0:
+            return
+        self.stall_tokens += tokens
+        if owner:
+            entry = self.usage_ledger.setdefault(owner, {"input_tokens": 0, "output_tokens": 0})
+            entry["input_tokens"] += tokens
+
+    def stall_tokens_exceeded(self) -> bool:
+        """True when stalled-pattern tokens passed the per-run cap.
+
+        Used as a backstop *after* the soft hints are injected: a run that is
+        stuck in a failing pattern may keep injecting corrective context, but a
+        run whose stall accounting blows past the cap escalates to the human
+        handoff (``StopReason.STALLED``) instead of spinning forever.
+        """
+        return self.stall_tokens >= self._stall_tokens_cap
+
+    @property
+    def stall_token_cap(self) -> int:
+        return self._stall_tokens_cap
 
     def attach_quota_check(self, check: Callable[[int, int], bool] | None) -> None:
         """Attach an optional balance callback ``check(input, output) -> ok``.
@@ -276,6 +328,8 @@ class RunBudget:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "stall_tokens": self.stall_tokens,
+            "stall_tokens_exceeded": self.stall_tokens_exceeded(),
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "stop_reason": self.stop_reason.value if self.stop_reason else None,
             "usage_ledger": {owner: dict(entry) for owner, entry in sorted(self.usage_ledger.items())},

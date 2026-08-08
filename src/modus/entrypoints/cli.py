@@ -165,6 +165,8 @@ def _record_cli_audit(outcome: str, request: dict, detail: str) -> None:
             approver="cli-human",
             cwd=str(request.get("cwd") or ""),
             phase=str(request.get("impact_class") or "execution"),
+            scope="per-resource" if request.get("resource_key") else "per-tool",
+            resource_key=str(request.get("resource_key") or ""),
         )
     except Exception:
         return
@@ -257,7 +259,7 @@ def memory_cmd(
     data_dir = _data_dir()
     db.DB_DIR = data_dir
     db.DB_PATH = data_dir / "desktop.db"
-    db.init_db()
+    _db_startup(db)
     sid = _active_session(db)
     action = action.lower()
     if action == "set":
@@ -348,6 +350,303 @@ def mcp_cmd(
         )
 
 
+@app.command("goal")
+def goal_cmd(
+    action: Annotated[str, typer.Argument(help="set, get, status, pause, resume, continue, clear")],
+    objective: Annotated[str | None, typer.Option("--objective", "-o", help="Goal objective (set)")] = None,
+    cwd: Annotated[Path | None, typer.Option("--cwd")] = None,
+) -> None:
+    """Manage the Wave-4 cross-turn goal: set / inspect / pause / resume / clear.
+
+    A goal lets the agent keep attacking an objective across turns and runs
+    until it completes, hits its budget, or is blocked — instead of stopping
+    when one run's budget is spent.  ``continue`` re-arms a soft-stopped goal.
+    """
+    from modus.agent.goal import GoalStore
+
+    store = GoalStore()
+    key = None  # CLI shares the "default" session goal for now
+    # Rehydrate the persisted goal from disk so a fresh CLI process sees a goal
+    # set by an earlier process (cross-run continuation).
+    try:
+        store.load(key)
+    except Exception:
+        pass
+    action = action.lower()
+    if action == "set":
+        if not objective:
+            typer.echo("goal set requires --objective", err=True)
+            raise typer.Exit(1)
+        state = store.set(key, objective)
+        typer.echo(f"Goal set: {objective} (status={state.status})")
+    elif action in {"get", "status"}:
+        state = store.active(key) or store.get(key)
+        if state is None:
+            typer.echo("（无活动目标）")
+            return
+        typer.echo(
+            f"objective: {state.objective}\n"
+            f"status: {state.status}\n"
+            f"tokens: {state.tokens_used} · turns: {state.turns_executed}\n"
+            f"blocked: {state.blocked_count}x {state.blocked_reason or ''}\n"
+            f"created: {state.created_at}"
+        )
+    elif action == "pause":
+        state = store.pause(key)
+        typer.echo(f"Goal paused (status={state.status})")
+    elif action == "resume":
+        state = store.resume(key)
+        typer.echo(f"Goal resumed (status={state.status})")
+    elif action == "continue":
+        # A soft-stopped goal (budget_limited / max_turns) resets to active so
+        # the next run re-injects steering.
+        state = store.get(key)
+        if state is None:
+            typer.echo("（无目标可继续）")
+            return
+        store.resume(key)
+        typer.echo(f"Goal continued (status={state.status})")
+    elif action == "clear":
+        store.clear(key)
+        typer.echo("Goal cleared.")
+    else:
+        typer.echo(
+            f"unknown action: {action} (set/get/status/pause/resume/continue/clear)",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
+@app.command("evaluate")
+def evaluate_cmd(
+    run: Annotated[str | None, typer.Option("--run", help="Re-score an already-completed run by id")] = None,
+    suite: Annotated[Path | None, typer.Option("--suite", help="Batch-score a directory of scenario JSON files")] = None,
+    scorer: Annotated[str, typer.Option("--scorer", help="Scorer name from the registry")] = "static_json",
+    cwd: Annotated[Path | None, typer.Option("--cwd")] = None,
+) -> None:
+    """离线重评分：join 场景×已完成的 run 轨迹，输出 EvalReport。
+
+    重评分不重跑 agent：轨迹来自 run_events 已落盘的 event 流（或
+    ``~/.modus/trajectories/{run_id}.json``）。``--run`` 对一个已有 run 做结构
+    评分（terminal state/stop_reason/token），需要内容级判定（expected 对照）
+    时用 ``--suite`` 提供场景文件；``--suite`` 批跑一个目录下的 JSON 场景文件
+    （每个文件含 ``expected`` 与可选 ``run_id``/``match``），单个场景失败不中断
+    其余场景。
+    """
+    from modus.desktop import db as db_module
+
+    data_dir = _data_dir()
+    db_module.DB_DIR = data_dir
+    db_module.DB_PATH = data_dir / "desktop.db"
+    _db_startup(db_module)
+
+    if run:
+        _evaluate_run(db_module, run, scorer=scorer)
+        return
+    suite_path = Path(suite) if suite is not None else None
+    if suite_path is not None:
+        if not suite_path.is_dir():
+            typer.echo(f"suite 目录不存在：{suite_path}", err=True)
+            raise typer.Exit(2)
+        _evaluate_suite(db_module, suite_path.resolve(), scorer=scorer)
+        return
+    typer.echo("evaluate 需要 --run <id> 或 --suite <dir>", err=True)
+    raise typer.Exit(2)
+
+
+def _evaluate_run(db_module: Any, run_id: str, *, scorer: str) -> None:
+    """Score one completed run and print a report.
+
+    A single run has no machine-scorable ``expected`` reference unless its
+    scenario is provided, so ``--run`` reports the run's own structural outcome
+    (terminal state, stop reason, tool usage, budget) and — when the run's
+    ``final_result`` carries structured JSON that the static_json comparator
+    can parse against the run's ``objective`` — a content score.  Content
+    scoring against a real reference answer is the ``--suite`` path.
+    """
+    from modus.evaluation import Evaluator, EvalReport
+
+    run = db_module.get_run(run_id)
+    if run is None:
+        typer.echo(f"未找到 run：{run_id}", err=True)
+        raise typer.Exit(1)
+
+    evaluator = Evaluator()
+    if scorer != "static_json":
+        # A registered custom scorer still sees the full trajectory.
+        trajectory = db_module.load_trajectory(run_id) or {
+            "run_id": run_id, "state": run.get("state"),
+            "objective": run.get("objective"),
+            "final_result": run.get("final_result"),
+            "budget": run.get("budget") or {},
+            "events": db_module.get_run_events(run_id),
+        }
+        score = evaluator.score(
+            {"scenario_id": "run", "run_id": run_id,
+             "expected": _infer_expected(str(run.get("objective") or ""))},
+            trajectory, scorer=scorer,
+        )
+    else:
+        score = _structural_score(run)
+
+    state = str(run.get("state") or "")
+    report = EvalReport({"schema": "modus.eval-report.v1", "scenarios": [{
+        "scenario_id": "run", "runs": 1,
+        "passed": int(score.get("pass")), "failed": int(not score.get("pass")),
+        "partial": int(bool(score.get("partial"))),
+        "pass": bool(score.get("pass")),
+        "score": score.get("f1") or 0.0,
+        "precision": score.get("precision") or 0.0,
+        "recall": score.get("recall") or 0.0,
+        "tokens": {"total_tokens": int((run.get("budget") or {}).get("total_tokens") or 0)},
+        "cost_usd": score.get("cost_usd") or 0.0,
+        "latency_ms": {"p50": score.get("latency_ms") or 0.0, "p95": 0.0},
+        "reasons": [str(score.get("reason") or "")],
+        "run_ids": [run_id],
+    }], "summary": {
+        "scenarios": 1, "runs": 1,
+        "passed": int(score.get("pass")), "failed": int(not score.get("pass")),
+        "pass": bool(score.get("pass")),
+        "precision": score.get("precision") or 0.0,
+        "recall": score.get("recall") or 0.0,
+        "f1": score.get("f1") or 0.0,
+        "total_tokens": int((run.get("budget") or {}).get("total_tokens") or 0),
+        "cost_usd": score.get("cost_usd") or 0.0,
+    }})
+    _print_report(report)
+    typer.echo(f"\n[dim]run {run_id} · state={state} · "
+               f"objective={str(run.get('objective') or '')[:80]} · "
+               f"stop_reason={run.get('stop_reason') or '-'}[/dim]")
+
+
+def _structural_score(run: dict) -> dict:
+    """Structural verdict for a single run when no reference answer exists.
+
+    A completed run passes structurally (it reached a terminal success with a
+    durable outcome); any other terminal state fails with its stop reason.
+    ``partial`` reports that the run reached a terminal state even when it did
+    not complete, so a failed/interrupted run still shows as "partially"
+    resolved rather than silently skipped.
+    """
+    state = str(run.get("state") or "")
+    passed = state == "completed"
+    reason = (
+        "run completed; a structured reference answer is only scored via --suite"
+        if passed
+        else f"run did not complete (state={state}, stop_reason={run.get('stop_reason') or '-'})"
+    )
+    return {
+        "pass": passed,
+        "partial": state in {"completed", "failed", "interrupted"},
+        "strict": passed,
+        "precision": 0.0, "recall": 0.0, "f1": 0.0,
+        "matched": 0, "expected_count": 0, "predicted_count": 0,
+        "missing_keys": [], "extra_keys": [], "diffs": [],
+        "reason": reason,
+        "answer": str(run.get("final_result") or "")[:2000],
+        "parsed": None,
+        "run_id": str(run.get("run_id") or ""),
+        "scenario_id": "run",
+    }
+
+
+def _evaluate_suite(db_module: Any, suite_dir: Path, *, scorer: str) -> None:
+    """Batch-score every JSON scenario file in ``suite_dir`` (failure-isolated)."""
+    from modus.evaluation import Evaluator, EvalReport
+    from modus.evaluation.evaluator import EvaluationError
+
+    evaluator = Evaluator()
+    joins: list[tuple[dict, dict | str]] = []
+    skipped: list[str] = []
+    for path in sorted(suite_dir.glob("*.json")):
+        try:
+            scenario = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            skipped.append(f"{path.name}（解析失败：{exc}）")
+            continue
+        if not isinstance(scenario, dict) or "expected" not in scenario:
+            skipped.append(f"{path.name}（缺少 expected 字段）")
+            continue
+        scenario.setdefault("scenario_id", path.stem)
+        target = scenario.get("run_id")
+        if target:
+            joins.append((scenario, str(target)))
+        else:
+            # No explicit run: score against every persisted trajectory of the
+            # suite, so a scenario file can evaluate a whole batch of runs.
+            for trajectory in db_module.list_trajectories():
+                joins.append((scenario, str(trajectory.get("run_id") or "")))
+
+    scores: list[dict] = []
+    for scenario, target in joins:
+        try:
+            scores.append(evaluator.score(scenario, target, scorer=scorer))
+        except EvaluationError as exc:
+            # Failure isolation: one bad join must not abort the suite.
+            skipped.append(f"{scenario.get('scenario_id')}@{target}（{exc}）")
+
+    if not scores:
+        typer.echo("suite 没有可评分的场景", err=True)
+        for item in skipped:
+            typer.echo(f"  - 跳过：{item}", err=True)
+        raise typer.Exit(1)
+    report = EvalReport(_build_suite_report(scores))
+    _print_report(report)
+    if skipped:
+        typer.echo(f"\n[dim]跳过 {len(skipped)} 个场景：[/dim]")
+        for item in skipped:
+            typer.echo(f"  - {item}")
+
+
+def _build_suite_report(scores: list[dict]) -> dict:
+    from modus.evaluation import build_report
+
+    return build_report(scores)
+
+
+def _infer_expected(objective: str) -> dict:
+    """Derive a minimal expected dict from a run objective.
+
+    The offline evaluator needs an ``expected`` reference.  A bare objective is
+    not machine-scorable, so we return an empty dict and let the static_json
+    scorer report "no structured answer" rather than guessing.  Scenario files
+    (``--suite``) always carry a real ``expected``.
+    """
+    return {}
+
+
+def _print_report(report: Any) -> None:
+    """Render an EvalReport as a compact rich table."""
+    from rich.table import Table
+
+    summary = report.summary
+    console.print(
+        f"[bold]EvalReport[/bold] · "
+        f"scenarios={summary.get('scenarios')} runs={summary.get('runs')} "
+        f"passed={summary.get('passed')} failed={summary.get('failed')} "
+        f"tokens={summary.get('total_tokens')} cost=${summary.get('cost_usd')}"
+    )
+    table = Table(title="场景 × 轨迹")
+    table.add_column("scenario")
+    table.add_column("pass")
+    table.add_column("f1")
+    table.add_column("precision")
+    table.add_column("recall")
+    table.add_column("tokens")
+    table.add_column("reason")
+    for scenario in report.scenarios:
+        table.add_row(
+            str(scenario.get("scenario_id") or ""),
+            "✅" if scenario.get("pass") else "❌",
+            f"{scenario.get('score') or 0:.3f}",
+            f"{scenario.get('precision') if 'precision' in scenario else ''}",
+            f"{scenario.get('recall') if 'recall' in scenario else ''}",
+            str((scenario.get("tokens") or {}).get("total_tokens") or ""),
+            str((scenario.get("reasons") or [""])[0])[:60],
+        )
+    console.print(table)
+
+
 def _data_dir() -> Path:
     env = __import__("os").environ.get("MODUS_DATA_DIR")
     if env:
@@ -364,6 +663,29 @@ def _active_session(db_module: Any) -> str:
     return str(db_module.create_session("cli")["id"])
 
 
+def _db_startup(db_module: Any) -> None:
+    """Converged startup: writer lease -> schema migration -> only then write.
+
+    The shared ``desktop.db`` has exactly one writer at a time.  A second
+    Modus instance (Desktop/CLI/MCP) holding the lease is reported with an
+    explicit error instead of silently racing writes.  Read-only queries stay
+    allowed without the lease (WAL already permits many readers), so a
+    headless reader never needs to hold it.
+    """
+    from modus.desktop.db import acquire_writer_lease, WriterLeaseError
+
+    try:
+        if not acquire_writer_lease():
+            raise WriterLeaseError(
+                "另一个 Modus 实例正在运行并占用数据库（%s）。"
+                "请先关闭它，或使用只读查询。" % db_module.DB_PATH
+            )
+        db_module.init_db()
+    except WriterLeaseError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1)
+
+
 def _repl_session() -> tuple[Any, str]:
     """Initialize the CLI's own persistent database and return (db, session_id).
 
@@ -377,7 +699,7 @@ def _repl_session() -> tuple[Any, str]:
     data_dir = _data_dir()
     db.DB_DIR = data_dir
     db.DB_PATH = data_dir / "desktop.db"
-    db.init_db()
+    _db_startup(db)
     sid = _active_session(db)
     return db, sid
 

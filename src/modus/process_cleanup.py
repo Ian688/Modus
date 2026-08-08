@@ -73,7 +73,14 @@ def cleanup_spawned_processes(*, signal_triggered: bool = False) -> None:
     live: list[tuple[str, dict[str, Any]]] = []
     for process_id, meta in owned:
         status = str(meta.get("status") or "running")
-        if status in ("exited", "stopped"):
+        # Supervisor terminal states (T5) need no cleanup: the supervisor already
+        # recorded the exit and the pid is gone.  ``backoff`` has a dead child
+        # between retries; ``completed``/``failed``/``fatal`` are given-up /
+        # finished; ``exited``/``stopped``/``cancelled`` are manual terminals.
+        if status in (
+            "exited", "stopped", "cancelled", "completed", "failed", "fatal",
+            "backoff", "pid_reused",
+        ):
             continue
         # Identity check: a pid alive but with a different start time means the
         # OS reused our old pid for a different process — do not kill a

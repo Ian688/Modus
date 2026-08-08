@@ -739,3 +739,130 @@ Phase 0 是蓝图中最小、解锁后续一切的落地。
 - react.py ToolContext 装配 grant_store（per-session 单例）
 - 全量 **1277 passed, 1 skipped**（基线 1190 → +87）；六条安全不变量测试 86 全过
 - 待接线：builtins.py permission_hint（executor _default_* 已等价）；AuditLog scope 字段
+
+## 并行第二批（2026-08-08）——T4 / A3 / G1 三 agent 同时开发
+
+**Stream T4 多实例协调 + schema 版本化**（db.py + cli.py + server.py）
+- SCHEMA_VERSION=2 + _MIGRATIONS forward 迁移表（PRAGMA user_version 驱动，每步一个事务防半应用）
+- _backup_before_migrate 原子备份到 ~/.modus/backup/db-v{n}.bak；版本>当前显式拒绝降级
+- writer 租约（fcntl.flock/msvcrt，非阻塞，进程死自动释放，fail-soft）；只读查询不抢租约
+- _ensure_column 迁入迁移表；CLI/Desktop 启动收敛（租约→迁移→才写，第二实例明确报错）
+- 测试：test_db_instance_coordination(11) + 309 受影响全绿
+
+**Stream A3 coverage 矩阵**（coverage.py + builtins + board_aggregation + server.py）
+- CoverageStore：键控 (objective, operation, capability)→state；mark/untested/list/summary/clear
+- JSONL 落盘 + write-coalescing + 5000 上限 LRU；coverage 工具声明 read_only+safe
+- board_aggregation 加 coverage 段；kanban 显示"未覆盖"计数
+- 测试：test_coverage_matrix(20) + 200+ 受影响全绿
+
+**Stream G1 Goal 状态机**（goal.py + react.py + select.py + budget.py）
+- GoalState 7 态（active/paused/budget_limited/max_turns/blocked/complete）+ 3-strike blocked
+- GoalStore：per-session + JSONL 持久化 + tombstone 防复活；idle 续跑钩子（每轮开头注入 goal-steering）
+- GoalReasoner（agent_mode=goal）；goal 工具（get/update/complete/blocked，safe+read_only）
+- budget_limited 软停 + 交接总结轮（非硬断）；StopReason.GOAL_BUDGET_LIMITED/GOAL_MAX_TURNS
+- 测试：test_goal(24) + 175 受影响全绿
+
+**协调者接线（我）**
+- CLI `/goal` 命令（set/get/status/pause/resume/continue/clear）——修了跨进程 bug：GoalStore 需显式 load() 才能从磁盘恢复，CLI 已加
+- react.py 每轮 tool 后 mark coverage（mark_coverage_call 同步助手）
+- 全量 **1332 passed, 1 skipped**（1277 → +55）
+
+### 累计进度（五波 21 项，已落地 11 项）
+W0-1 worker ✅ / T1 进程出身 ✅ / T2 数据治理 ✅ / T3 审批超时 ✅ / T4 多实例 ✅
+C1 cache ✅ / C2 压缩 ✅ / A1 作用域审批 ✅ / A2 拒绝回灌 ✅ / A3 coverage ✅ / G1 Goal ✅
+
+## 并行第三批（2026-08-08）——G2 / C3 / T5 三 agent 同时开发
+
+**Stream G2 停滞检测 + 上下文剪枝**（stall.py + react.py + budget.py + plan_execute.py）
+- error_signature 归一化 + trigram 相似度（Dice 系数，零 LLM，蓝图不变量 4）
+- 四级熔断：ok/watch/stall/loop；stall/loop 注入 reference-only [STALL DETECTED] 块（非硬断）
+- loop 连续 ≥2 → StopReason.STALLED 人工交接；停滞期间 token 单独计数（stall_tokens）
+- plan 级停滞：同一步重复失败 → 整 plan STALLED；下一 task 注入 stall 上下文
+- 测试：test_stall_detection(32) + 338 受影响全绿
+
+**Stream C3 大结果句柄化 + 内容寻址缓存**（artifacts.py + builtins.py + executor.py）
+- persist_oversized（>100KB 落盘 + 句柄 {path, sha256, size, preview}）+ 内容寻址缓存
+- cache_key 只剥 secret 不剥 limit（**修了真实 bug**：limit=2 会误复用 limit=100000 的句柄）
+- _MUTATING_TOOLS（23 工具）写后失效缓存；artifact_is_intact 完整性校验
+- executor 兜底桥接：deny/skip 结构化回灌明确排除（metadata.operation 标记）
+- grep/search_code 句柄化；tail 留给 T5 后协调者接
+- 测试：test_result_bridge(21)
+
+**Stream T5 进程状态机 + 退避重启**（process_tools.py + process_cleanup.py）
+- STARTING→RUNNING（存活 ≥ startsecs）/ BACKOFF（too_quickly）/ failed（超限）；指数退避 0.25s 起翻倍
+- gen 代次 + 手动终态守卫：kill/cleanup 后 supervisor 让位，绝不复活
+- restart_process 工具（medium + requires_approval）；fatal/pid_reused 拒绝
+- **T1 保护验证**：AST 对比确认 _read_born_at/_pid_identity_ok/_owned_by_this_process/_pid_alive 与 HEAD 完全一致
+- 测试：test_process_state_machine(14) + 30 既有全绿
+
+**协调者接线（我）**
+- builtins 注册 restart_process 工具（import + Tool 声明）
+- artifacts._MUTATING_TOOLS 加 restart_process
+- 全量 **1399 passed, 1 skipped**（1332 → +67）；安全不变量 54 全过
+
+### 累计进度（五波 21 项，已落地 14 项）
+W0-1 worker ✅ / T1 进程出身 ✅ / T2 数据治理 ✅ / T3 审批超时 ✅ / T4 多实例 ✅ / T5 状态机 ✅
+C1 cache ✅ / C2 压缩 ✅ / C3 句柄化 ✅ / A1 作用域审批 ✅ / A2 拒绝回灌 ✅ / A3 coverage ✅
+G1 Goal ✅ / G2 停滞检测 ✅
+
+### 剩余 7 项
+- Wave4：G3 后台完成唤醒续跑
+- Wave5：E1 轨迹重评分 / E2 后台审查 fork / E3 会话树
+- 其他：builtins permission_hint 接线、AuditLog scope 字段、W0-2 office_exec worker 接线
+
+## 并行第四批（2026-08-08）——E1 / G3+scope / E2+接线 三 agent 同时开发
+
+**Stream E1 轨迹→离线重评分评估闭环**（db.py + cli.py + 新 evaluation 包）
+- db.py SCHEMA_VERSION 2→3：run_events.tool_calls + runs.objective/final_result；三条事件路径写 tool_calls
+- persist_trajectory 落盘 ~/.modus/trajectories/{run_id}.json；settle/interrupt 后自动 sink
+- evaluation 包：Evaluator（join 场景×轨迹 + contextvar 注入 + scorer 注册表 + 自评防护）+ static_json（噪音解析/flatten/delta-1/区间匹配）+ report（token/cost/p50/p95）
+- `modus evaluate` 命令（--run 单跑 / --suite 批跑）
+- 测试：test_evaluation_trajectory(19) + 470+ 受影响全绿
+
+**Stream G3 后台完成唤醒续跑 + AuditLog scope**（process_tools + server + audit_log + approval）
+- spawn_process 加 resume_on_complete（默认 False）；reaper 完成后发 process_completed 事件（持久标记防重）
+- server：process_completed 推 WS → 前端可点"继续"；resume_on_complete=True 且成功才自动续跑（预算减半 + 完成上下文）
+- resume_process WS command；consume_process_resume 一次额度（原子领取）
+- audit_log.record 加 scope/resource_key 字段；SessionGrantStore.audit_scope()
+- 测试：test_process_resume(16) + test_audit_log(+9) + 265 受影响全绿
+
+**Stream E2 后台审查 fork + 接线**（memory + skills + turn_finalizer + builtins + office_exec）
+- memory 加 authority 字段（confirmed/curated/auto）；auto 记忆注入带"auto-extracted 未经验证"披露；检索按 authority 加权
+- skills 加生命周期 active/stale/archived + usage 边车 + curator（超期降级，可恢复）；load_skill 调 mark_used
+- turn_finalizer：N 轮 + 成功工具调用 → 后台审查 fork（复用 spawn_subtask）；provenance 门只写 curator 属地
+- **permission_hint 接线完成**：bash/run_tests→command、web_fetch/browser_navigate→origin、write_file/edit_file/office_exec→path、git→remote
+- office_exec worker 接线确认完整
+- 测试：test_background_review(16) + test_skills(+lifecycle) + test_approval_scoping(+hints) + 196 受影响全绿
+
+**协调者接线（我）**
+- cli.py _record_cli_audit 透传 scope/resource_key 到 audit_log
+- timeline.js 加 process_completed case + "继续"按钮（data-resume-process 事件委托 + resume_process WS 发送）
+- 全量 **1475 passed, 1 skipped**（1399 → +76）；安全不变量 54 全过
+
+### 累计进度（五波 21 项，已落地 18 项）
+W0-1 ✅ T1 ✅ T2 ✅ T3 ✅ T4 ✅ T5 ✅ C1 ✅ C2 ✅ C3 ✅ A1 ✅ A2 ✅ A3 ✅ G1 ✅ G2 ✅ G3 ✅ E1 ✅ E2 ✅
++ 全部小接线（permission_hint / AuditLog scope / office worker / CLI goal / resume 前端）
+
+### 剩余 3 项
+- E3 会话树 + 原地分支 + steer/followUp（Wave5 最后一项，动 db.py messages 表 + 前端）
+
+## E3 会话树 + steer/followUp（2026-08-08）——五波全部完成 ✅
+
+**E3 后端**（db.py + react.py + server.py + compressor.py）
+- db.py SCHEMA_VERSION 3→4：messages 加 parent_message_id + branch_root_id；session_branches 表（leaf 指针）；索引
+- add_message 支持 parent_id（隐式续 leaf + 推进）；session_branch/session_revert/session_tree/current_session_leaf/get_session_messages（活跃分支 lineage）
+- react.py steer/followUp 双队列：steer 在工具结果回灌后、下轮 LLM 前注入（与 goal/stall 同窗口）；followUp run 结束后 drain
+- server.py：session_branch/revert/tree WS 命令（运行中拒绝）；run_message 支持 steer:true → 入 steer_queue
+- compressor：active_branch_rows + branch_messages_to_context（分支重建，复用 turn-aligned tail）
+- 测试：test_session_tree(17) + 391 受影响全绿
+
+**协调者接线（我）**
+- 修 T4 备份测试的 glob 顺序 bug（sorted()[0] 取最早备份，v4 备份排序变化导致）
+- timeline.js run 完成卡片加"分叉继续"按钮（data-branch-continue → run_message steer+branch_from）
+- 全量 **1492 passed, 1 skipped**（1475 → +17）；安全不变量全过
+
+## 🎉 五波 21 项全部落地（本会话累计）
+W0-1 ✅ T1✅ T2✅ T3✅ T4✅ T5✅ C1✅ C2✅ C3✅ A1✅ A2✅ A3✅
+G1✅ G2✅ G3✅ E1✅ E2✅ E3✅ + 全部小接线（permission_hint/AuditLog scope/office worker/CLI goal/resume 前端/分支前端）
+
+测试：**1492 passed, 1 skipped**（会话起始 1165 → +327）

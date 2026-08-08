@@ -291,3 +291,62 @@ def _align_protected(messages: list[Message], protected: list[Message]) -> list[
                             result.append(other)
                         break
     return result
+
+
+# ── Branch-aware context rebuild (Wave5 E3) ───────────────────────────────
+
+
+def active_branch_rows(tree: dict[str, Any], *, current_leaf: int | None = None) -> list[dict[str, Any]]:
+    """Return the active-branch message rows from a ``session_tree`` result.
+
+    Walks ``parent_message_id`` from the tree's ``current_leaf`` back to the
+    root, oldest first.  Sibling / diverged messages (other branches) are
+    excluded, which is exactly what makes compression after a branch/revert
+    rebuild the *branch* context rather than the whole log.  A linear session
+    (no recorded branch pointer) walks the same parent chain and returns the
+    full history in durable order.
+    """
+    nodes = tree.get("nodes") or {}
+    leaf = current_leaf if current_leaf is not None else tree.get("current_leaf")
+    chain: list[dict[str, Any]] = []
+    current = int(leaf) if leaf is not None else 0
+    seen: set[int] = set()
+    while current and current not in seen:
+        seen.add(current)
+        node = nodes.get(current)
+        if node is None:
+            break
+        chain.append(node)
+        parent = node.get("parent_message_id")
+        current = int(parent) if parent is not None else 0
+    return list(reversed(chain))
+
+
+def branch_messages_to_context(
+    rows: list[dict[str, Any]],
+    *,
+    summary: str = "",
+    tail_count: int = 4,
+) -> list[Message]:
+    """Rebuild model context from a branch's durable message rows.
+
+    ``rows`` is the active-branch lineage (chronological) as returned by
+    ``db.get_session_messages`` or ``active_branch_rows``.  Rows are converted
+    to ``Message`` objects in durable order, then the existing turn-aligned
+    tail rule (``compress_messages``) is applied so a branch context is rebuilt
+    exactly like a linear one: the tail never starts mid-tool-turn and
+    protected messages (approval decisions, goal/task context) survive.
+    Returns the raw converted list when it is already within the tail budget.
+    """
+    rebuilt = [
+        Message(
+            role=str(row.get("role") or ""),
+            content=str(row.get("content") or ""),
+            tool_call_id=row.get("tool_call_id"),
+            tool_calls=list(row.get("tool_calls") or []),
+        )
+        for row in rows
+    ]
+    if len(rebuilt) <= tail_count + 2:
+        return rebuilt
+    return compress_messages(rebuilt, summary=summary, tail_count=tail_count)

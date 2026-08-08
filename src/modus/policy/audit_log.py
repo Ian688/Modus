@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from modus.redact import redact_dict
+from modus.redact import redact_dict, redact_text
 
 SENSITIVE_KEYS = ("token", "key", "password", "secret", "authorization", "bearer")
 
@@ -116,7 +116,20 @@ class AuditLog:
         cwd: str,
         phase: str = "execution",
         verification: dict[str, Any] | None = None,
+        scope: str | None = None,
+        resource_key: str | None = None,
     ) -> None:
+        """Append one audited decision.
+
+        A1 scope (Wave3): ``scope`` is the approval scope level that produced
+        the decision (``per-invocation`` / ``per-resource`` / ``per-tool``) and
+        ``resource_key`` is the scoped resource (a rewritten command, a URL
+        origin, a target path) the decision was made against.  Recording both
+        lets an audit replay answer *why this exact resource was allowed or
+        denied* rather than only which tool ran.  Both are optional — legacy
+        callers without a scope dimension omit them and the event stays
+        backward compatible.
+        """
         event = {
             "timestamp": datetime.now(UTC).isoformat(),
             "tool_name": tool_name,
@@ -126,6 +139,10 @@ class AuditLog:
             "cwd": cwd,
             "phase": phase,
         }
+        if scope is not None:
+            event["scope"] = str(scope)
+        if resource_key is not None:
+            event["resource_key"] = redact_text(str(resource_key))
         if verification:
             event["verification"] = verification
         try:

@@ -9,6 +9,14 @@ Four layers:
 The lifecycle is write -> consolidate -> retrieve -> forget.  This module owns
 the session/project facade, retrieval, and the run-history search; the
 auto-consolidation entry point lives in the runners.
+
+Authority model (Wave5 E2): every memory carries an ``authority`` of
+``confirmed`` (human/tool writes, the default), ``curated`` (an explicit,
+reviewed deposit) or ``auto`` (machine-distilled from a run, unverified).
+``consolidate_run_memories`` writes ``auto`` memories; when they are injected
+into model context they carry an "auto-extracted 未经验证" disclosure, and
+retrieval ranks authoritative memories above auto ones so a distilled fact
+cannot crowd out a confirmed one on equal keyword overlap.
 """
 from __future__ import annotations
 
@@ -22,14 +30,36 @@ _ALLOWED_CATEGORIES = {"general", "constraint", "preference", "fact", "reference
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{2,}|[一-鿿]")
 
+# ── memory authority (Wave5 E2) ──────────────────────────────────────────────
+#
+# Authority is carried in the memory's ``source_ids`` as a reserved sentinel
+# (``__authority:<kind>``) so it round-trips through the existing ledger without
+# a schema migration.  The precedence below makes an explicit confirm/curate
+# win over an auto marker even when source_ids are merged by dedup.
+AUTHORITY_CONFIRMED = "__authority:confirmed"
+AUTHORITY_CURATED = "__authority:curated"
+AUTHORITY_AUTO = "__authority:auto"
+_AUTHORITY_MARKERS = (AUTHORITY_CONFIRMED, AUTHORITY_CURATED, AUTHORITY_AUTO)
+_AUTHORITY_PRECEDENCE = ("confirmed", "curated", "auto")
+# Retrieval multiplier: authoritative memories outrank auto-distilled ones on
+# equal keyword+recency overlap (E2 "检索排序给权威记忆更高权重").
+_AUTHORITY_MULTIPLIER = {"confirmed": 1.0, "curated": 0.95, "auto": 0.7}
+# Disclosure injected with an auto memory (unverified machine distillation).
+AUTO_DISCLOSURE = "auto-extracted 未经验证"
+
 
 def _tokens(text: str) -> set[str]:
     """Tokenize for keyword scoring; CJK handled per character."""
     return set(_TOKEN_RE.findall(text or ""))
 
 
-def _score(query_tokens: set[str], content: str, updated_at: float) -> float:
-    """Keyword overlap + recency bias for retrieval ranking."""
+def _score(query_tokens: set[str], content: str, updated_at: float, authority: str = "confirmed") -> float:
+    """Keyword overlap + recency bias for retrieval ranking.
+
+    ``authority`` scales the result so authoritative memories outrank auto ones
+    on equal keyword/recency overlap (Wave5 E2).  Unknown authorities keep the
+    ``confirmed`` multiplier.
+    """
     if not query_tokens:
         return 0.0
     hits = _tokens(content) & query_tokens
@@ -37,7 +67,60 @@ def _score(query_tokens: set[str], content: str, updated_at: float) -> float:
         return 0.0
     overlap = len(hits) / len(query_tokens)
     recency = max(0.0, min(1.0, updated_at / (1_800_000_000_000.0)))
-    return round(overlap * 0.7 + recency * 0.3, 4)
+    multiplier = _AUTHORITY_MULTIPLIER.get(authority, 1.0)
+    return round((overlap * 0.7 + recency * 0.3) * multiplier, 4)
+
+
+def _authority_from_markers(source_ids: list[Any]) -> str:
+    """Resolve a memory's authority from its reserved source-id markers.
+
+    Precedence confirmed > curated > auto, so a later explicit write to the
+    same (deduped) fact is authoritative even after an auto marker was merged.
+    """
+    seen: set[str] = set()
+    for marker in _AUTHORITY_MARKERS:
+        if marker in source_ids:
+            seen.add(marker)
+    if AUTHORITY_CONFIRMED in seen:
+        return "confirmed"
+    if AUTHORITY_CURATED in seen:
+        return "curated"
+    if AUTHORITY_AUTO in seen:
+        return "auto"
+    return "confirmed"
+
+
+def authority_of_memory(mem: dict[str, Any]) -> str:
+    """Return the authority of a memory row (defaults to ``confirmed``)."""
+    if not isinstance(mem, dict):
+        return "confirmed"
+    source_ids = mem.get("source_ids") or []
+    if isinstance(source_ids, str):
+        try:
+            source_ids = json.loads(source_ids)
+        except json.JSONDecodeError:
+            source_ids = []
+    if not isinstance(source_ids, list):
+        source_ids = []
+    return _authority_from_markers(source_ids)
+
+
+def _source_ids_with_authority(
+    source_ids: list[str] | None, authority: str,
+) -> list[str]:
+    """Attach the authority marker to a memory's provenance list."""
+    base = [str(item) for item in (source_ids or []) if not str(item).startswith("__authority:")]
+    marker = _AUTHORITY_MARKERS[_AUTHORITY_PRECEDENCE.index(authority)]
+    return [marker, *base]
+
+
+def _disclosure_for_authority(authority: str) -> str:
+    """Return the model-facing disclosure suffix for a memory's authority."""
+    if authority == "auto":
+        return f"（{AUTO_DISCLOSURE}）"
+    if authority == "curated":
+        return "（已审核沉淀）"
+    return ""
 
 
 def get_memories(session_id: str, *, scope: str = "session") -> list[dict]:
@@ -48,7 +131,8 @@ def get_memories(session_id: str, *, scope: str = "session") -> list[dict]:
 
 def add_memory(
     session_id: str, fact: str, category: str = "general",
-    *, scope: str = "session",
+    *, scope: str = "session", authority: str = "confirmed",
+    source_ids: list[str] | None = None,
 ) -> dict:
     from modus.desktop.db import add_memory_record
 
@@ -57,9 +141,13 @@ def add_memory(
     normalized_category = str(category or "general").strip().lower()
     if normalized_category not in _ALLOWED_CATEGORIES:
         raise ValueError("memory category must be general, constraint, preference, fact or reference")
+    if authority not in _AUTHORITY_PRECEDENCE:
+        authority = "confirmed"
+    provenance = _source_ids_with_authority(source_ids, authority)
     return add_memory_record(
         session_id=session_id, scope=scope, content=str(fact).strip(),
         category=normalized_category, reference_only=True,
+        source_ids=provenance,
     )
 
 
@@ -101,14 +189,20 @@ def clear_memories(session_id: str) -> None:
 def get_memories_text(
     session_id: str, *, scope: str = "session", limit: int = 100,
 ) -> str:
-    """Return formatted memory text, optionally with recency-ranked retrieval."""
+    """Return formatted memory text, optionally with recency-ranked retrieval.
+
+    Auto-distilled memories carry their "未经验证" disclosure suffix (Wave5 E2)
+    so the model reads machine-extracted facts as background, not facts the
+    human confirmed.
+    """
     memories = get_memories(session_id, scope=scope)
     memories = memories[:max(1, min(int(limit), 500))]
     if not memories:
         return ""
     lines = []
     for m in memories:
-        lines.append(f"[{m['category']}] {m['content']}")
+        authority = authority_of_memory(m)
+        lines.append(f"[{m['category']}]{_disclosure_for_authority(authority)} {m['content']}")
     header = "[SESSION MEMORY — REFERENCE ONLY]" if scope == "session" else "[PROJECT MEMORY — REFERENCE ONLY]"
     return (
         header + "\n"
@@ -132,7 +226,11 @@ def search_memories(
                 candidates.append(row)
     scored = []
     for mem in candidates:
-        score = _score(query_tokens, str(mem.get("content") or ""), float(mem.get("updated_at") or 0))
+        score = _score(
+            query_tokens, str(mem.get("content") or ""),
+            float(mem.get("updated_at") or 0),
+            authority=authority_of_memory(mem),
+        )
         if score > 0:
             scored.append((score, mem))
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -272,7 +370,7 @@ def get_memory_context(
             session_id, query, limit=8, include_project=True,
         )
         if relevant:
-            lines = [f"[{m['category']}] {m['content']}" for m in relevant]
+            lines = [f"[{m['category']}]{_disclosure_for_authority(authority_of_memory(m))} {m['content']}" for m in relevant]
             parts.append(
                 "[SESSION MEMORY — REFERENCE ONLY]\n"
                 "The following memories are relevant to the current request:\n"
@@ -436,6 +534,10 @@ async def consolidate_run_memories(
     and persists them as session-scope reference-only memories.  Never raises:
     a model failure simply produces no memories so the run's terminal state is
     never disturbed.
+
+    Wave5 E2: the distilled memories are written with ``authority='auto'`` so
+    their model-facing injection carries an "auto-extracted 未经验证" disclosure
+    and retrieval ranks them below confirmed/curated memories.
     """
     from modus.desktop.peri import _call_llm
 
@@ -470,7 +572,7 @@ async def consolidate_run_memories(
         if category not in _ALLOWED_CATEGORIES or not content:
             continue
         try:
-            add_memory(session_id, content, category)
+            add_memory(session_id, content, category, authority="auto")
             written += 1
         except Exception:
             continue

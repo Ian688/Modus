@@ -20,6 +20,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from modus.agent.planning import ExecutionPlan, parse_plan
+from modus.agent.stall import (
+    LEVEL_LOOP, LEVEL_STALL, Ledger, build_stall_context_block,
+)
 from modus.config import ModusConfig
 from modus.llm.base import LlmClient
 from modus.runtime.budget import RunBudget, RunLimits, StopReason
@@ -80,6 +83,11 @@ class PlanExecuteReasoner:
         # Per-task outcome ledger for replan-on-failure.
         self._task_outcomes: dict[str, str] = {}
         self._replanned = False
+        # Deterministic plan-level stall detection (Wave4 G2): every task
+        # outcome is recorded so a plan that keeps re-failing the same task
+        # (or a whole step) is caught without an LLM.
+        self._ledger = Ledger()
+        self._plan_stalled = False
 
     def _task_budget(self) -> RunBudget:
         """Derive a per-task budget from the shared run budget's limits."""
@@ -92,6 +100,51 @@ class PlanExecuteReasoner:
             max_verification_attempts=limits.max_verification_attempts,
         )
         return RunBudget(task_limits)
+
+    def _record_task_outcome(self, task: Any, outcome: str) -> None:
+        """Record one task outcome into the plan-level stall ledger.
+
+        ``outcome`` is the inner ReAct loop's stop reason (``completed``,
+        ``no_progress``, ``stalled``, ``engine_error``, ``max_turns``, ...) or
+        ``"failed"`` for an errored task.  Best-effort; a ledger failure never
+        breaks the plan.  When the circuit breaker escalates to ``loop`` we
+        mark the plan as stalled so the executor stops spinning the remaining
+        steps and hands the run to a human.
+        """
+        try:
+            completed = outcome == "completed"
+            action = task.id
+            if completed:
+                self._ledger.add(action=action, outcome="success", error_text="")
+            else:
+                self._ledger.add(
+                    action=action, outcome="error",
+                    error_text=str(outcome), tokens=0,
+                )
+            level = self._ledger.check_circuit_breaker().level
+            if level in (LEVEL_STALL, LEVEL_LOOP):
+                self._plan_stalled = True
+        except Exception:
+            return
+
+    def _stall_context_message(self) -> str | None:
+        """Render the plan-level ``[STALL DETECTED]`` context block, if any.
+
+        Injected as a reference-only user message into the next task's context
+        so the inner loop (and any replan) can change course.  Returns None
+        while the plan is not stalled, so the shared run context is untouched
+        in the normal case.
+        """
+        try:
+            result = self._ledger.check_circuit_breaker()
+        except Exception:
+            return None
+        if result.level not in (LEVEL_STALL, LEVEL_LOOP):
+            return None
+        return build_stall_context_block(
+            result.level, action=result.action, count=result.count,
+            signature=result.signature, pattern=result.pattern or None,
+        )
 
     def _run_react(self, messages, approval_callback, cancel_event, *, budget=None):
         from modus.agent.strategies import ReActReasoner
@@ -164,13 +217,19 @@ class PlanExecuteReasoner:
                 approval_callback, cancel_event,
             ):
                 yield event
+            # Deterministic plan-level stall escalation (Wave4 G2): a plan that
+            # keeps re-failing the same step hands the run to a human instead
+            # of spinning the remaining tasks.  Conservative: never while
+            # verification owns recovery (the verification loop terminates it).
+            verification_required = bool(
+                self.budget.verification.snapshot().get("required", False)
+            )
+            if self._plan_stalled and not verification_required:
+                terminal_reason = StopReason.STALLED
+                break
             if terminal_reason in {StopReason.MAX_TURNS, StopReason.CANCELLED}:
                 break
-            for task in ready:
-                completed.add(task.id)
-            # Replan-on-failure: if a task in this batch ended non-completed,
-            # rebuild the remaining plan once and continue.  Gated off while
-            # verification is required (the verification loop owns recovery).
+            # Determine which ready tasks failed in this batch.
             failed = [
                 task for task in ready
                 if self._task_outcomes.get(task.id, "completed") != "completed"
@@ -178,6 +237,10 @@ class PlanExecuteReasoner:
             verification_required = bool(
                 self.budget.verification.snapshot().get("required", False)
             )
+            # Replan-on-failure: if a task in this batch ended non-completed,
+            # rebuild the remaining plan once and continue.  Gated off while
+            # verification is required (the verification loop owns recovery).
+            replanned = False
             if failed and not self._replanned and not verification_required:
                 self._replanned = True
                 failed_desc = "\n".join(
@@ -190,15 +253,28 @@ class PlanExecuteReasoner:
                 )
                 new_plan = await self._make_plan(replan_goal)
                 if new_plan is not None:
+                    replanned = True
                     yield {"type": "plan_replan",
                            "failed_task_ids": [task.id for task in failed],
                            "revised_tasks": [task.id for task in new_plan.tasks]}
-                    # The failed tasks were marked completed above; unmark them
+                    # The failed tasks were marked completed below; unmark them
                     # so the new plan re-runs them.
                     for task in failed:
                         completed.discard(task.id)
                     plan = new_plan
                     continue
+            for task in ready:
+                # Deterministic plan-level stall (Wave4 G2): a task that failed
+                # and was NOT handed to a successful replan is not "done" —
+                # leave it unfinished so the plan retries it.  The stall ledger
+                # bounds those retries: the same step failing 3x (same error
+                # signature) — or 5 failing steps with no success — escalates
+                # the whole plan to ``StopReason.STALLED``.  Runs gated on
+                # verification keep existing behavior (the verification loop
+                # owns recovery and terminates).
+                if task in failed and not replanned and not verification_required:
+                    continue
+                completed.add(task.id)
             if not plan.ready_tasks(completed):
                 break
 
@@ -242,7 +318,14 @@ class PlanExecuteReasoner:
         ``send`` value is not used; the caller reads ``task_outputs`` after.
         """
         async def stream():
-            task_context = _task_messages(plan, task, task_outputs, messages_snapshot)
+            # Plan-level stall context (Wave4 G2): when the plan is repeating a
+            # failing task, the next task's prompt carries the reference-only
+            # ``[STALL DETECTED]`` block so the inner loop can change course.
+            stall_context = self._stall_context_message()
+            task_context = _task_messages(
+                plan, task, task_outputs, messages_snapshot,
+                stall_context=stall_context,
+            )
             # Record the pre-run context length.  ReActReasoner appends its
             # assistant/tool messages IN PLACE to ``task_context``, so the
             # post-run list is a superset of the pre-run context; the new tail
@@ -268,6 +351,10 @@ class PlanExecuteReasoner:
                     text += str(event.get("text") or "")
                 yield event
             self._task_outcomes[task.id] = task_stop
+            # Deterministic plan-level stall ledger (Wave4 G2): record this
+            # task's outcome so a plan that keeps re-failing the same step is
+            # caught.  Best-effort; never breaks the plan.
+            self._record_task_outcome(task, task_stop)
             self.budget.record_usage(
                 task_budget.input_tokens, task_budget.output_tokens,
                 owner=f"plan:task_{task.id}",
@@ -359,6 +446,8 @@ def _latest_user_text(messages: list[Message]) -> str:
 def _task_messages(
     plan: ExecutionPlan, task: Any, outputs: dict[str, str],
     original: list[Message],
+    *,
+    stall_context: str | None = None,
 ) -> list[Message]:
     """Build the model context for one task: goal + dependency results + task."""
     by_id = {t.id: t for t in plan.tasks}
@@ -375,6 +464,13 @@ def _task_messages(
         f"依赖任务结果：\n{dep_block}\n\n"
         f"请完成此任务。用工具验证你的结论。完成时给出简洁结果。"
     )
-    # Keep the system contract, then the task prompt as the user turn.
+    # Keep the system contract, then the task prompt as the user turn, then the
+    # optional reference-only stall-context block (Wave4 G2).
     head = [m for m in original if m.role == "system"][:1]
+    if stall_context:
+        return [
+            *head,
+            Message(role="user", content=task_prompt),
+            Message(role="user", content=stall_context),
+        ]
     return [*head, Message(role="user", content=task_prompt)]

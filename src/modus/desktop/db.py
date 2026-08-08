@@ -1,18 +1,21 @@
 """Modus Desktop SQLite persistence."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import time
 import uuid
 from contextlib import suppress
+from dataclasses import fields, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from modus.redact import redact_dict
+from modus.redact import redact_dict, redact_text
 from modus.modes import DEFAULT_MODE, normalize_mode
 from modus.paths import data_dir
 
@@ -20,6 +23,192 @@ logger = logging.getLogger(__name__)
 
 DB_DIR = data_dir()
 DB_PATH = DB_DIR / "desktop.db"
+
+# Current schema revision, tracked with ``PRAGMA user_version``.  Every schema
+# change is an entry in ``_MIGRATIONS`` keyed by the version it introduces;
+# ``init_db`` walks forward from the database's stored version, backing up
+# before each step.  The first numbered version ``2`` captures every ALTER the
+# codebase historically applied ad hoc through ``_ensure_column``.  Version 1
+# (the pre-history base schema) is never stamped: an unversioned database is
+# treated as already at version 1 so old data migrates rather than being
+# rebuilt.  A database from a *newer* version is refused, never downgraded.
+#
+# Version 4 (Wave5 E3) turns ``messages`` into a session tree: every row gains
+# a ``parent_message_id`` link and a ``branch_root_id`` (NULL = mainline), and
+# branch/revert operations are recorded in the new ``session_branches`` table
+# whose latest row is the current leaf pointer.  Switching branches never
+# copies history and never rewrites existing rows.
+SCHEMA_VERSION = 4
+
+# Each forward migration is (target_version, fn(conn)).  Steps run inside one
+# transaction each and bump ``user_version`` on success, so a crash never
+# leaves a half-applied step at its target version.  ``_MIGRATIONS`` itself is
+# defined after the migration functions it references (see below).
+
+# Lock file guarding exclusive write access to desktop.db across processes.
+# Writers (CLI/Desktop/MCP/spawn subprocesses) hold a shared file descriptor
+# flock for their lifetime; a second writer is refused with an explicit
+# "another instance is running" error.  Read-only queries never touch the
+# lease: WAL already allows many readers with one writer, so recall / index
+# reads stay concurrent with a live writer.
+_LOCK_FILENAME = "instance.lock"
+
+
+class WriterLeaseError(RuntimeError):
+    """Raised when another Modus instance holds the writer lease on desktop.db."""
+
+
+class _WriterLease:
+    """An advisory exclusive writer lease on the shared desktop.db.
+
+    Holds an open handle on ``<DB_DIR>/instance.lock`` with an exclusive
+    ``fcntl.flock`` / ``msvcrt.locking`` for the life of the object.  The
+    lock is released automatically when the handle closes or the process
+    exits (the OS drops the lock), so a crash cannot leave the database
+    permanently locked.  ``__del__`` is a best-effort backstop.
+    """
+
+    def __init__(self, lock_path: Path) -> None:
+        self._path = lock_path
+        self._file: Any = None
+        self._acquired = False
+        self._os = os.name
+        self._no_locking = False
+
+    def _try_lock(self, f: Any) -> bool:
+        if self._no_locking:
+            return False
+        if self._os == "nt":
+            try:
+                import msvcrt
+
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                return False
+        try:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except ImportError:
+            # No advisory-lock primitive on this platform: fail soft by
+            # treating the lease as "not contested" so a headless/server
+            # context is never blocked by an unavailable mechanism.
+            self._no_locking = True
+            logger.warning(
+                "no fcntl/msvcrt on this platform; writer lease disabled (%s)",
+                self._path,
+            )
+            return False
+        except OSError:
+            return False
+
+    def acquire(self) -> bool:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            f = open(self._path, "a+", encoding="utf-8")
+        except OSError:
+            # Cannot create the lock file at all: fail soft rather than block
+            # legitimate single-instance use (for example an unwritable or
+            # read-only data directory).
+            logger.warning("cannot open writer lease %s; continuing without lock", self._path)
+            return True
+        # Ensure the lock file carries at least one byte: ``msvcrt.locking``
+        # is unreliable on an empty region on Windows.
+        with suppress(OSError):
+            if f.tell() == 0:
+                f.write("modus\n")
+                f.flush()
+            f.seek(0)
+        if self._try_lock(f):
+            self._file = f
+            self._acquired = True
+            return True
+        if self._no_locking:
+            # Platform has no locking primitive: proceed unlocked but keep the
+            # handle for symmetry (release becomes a no-op).
+            self._file = f
+            self._acquired = True
+            return True
+        # A real contention: another instance holds the lease.
+        f.close()
+        return False
+
+    def release(self) -> None:
+        if self._file is not None:
+            try:
+                if self._os == "nt":
+                    import msvcrt
+
+                    with suppress(OSError):
+                        self._file.seek(0)
+                        msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    with suppress(Exception):
+                        import fcntl
+
+                        fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            with suppress(Exception):
+                self._file.close()
+            self._file = None
+        self._acquired = False
+
+    def close(self) -> None:
+        self.release()
+
+    def __enter__(self) -> "_WriterLease":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort backstop
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+# Current process's lease object.  ``acquire_writer_lease`` / ``release_*``
+# are idempotent so CLI/Desktop startup can share the acquired lease without
+# double-locking.
+_writer_lease: _WriterLease | None = None
+
+
+def _lock_path() -> Path:
+    return DB_DIR / _LOCK_FILENAME
+
+
+def acquire_writer_lease() -> bool:
+    """Try to take the exclusive writer lease on desktop.db.
+
+    Returns True when this process now holds the lease (or already holds it).
+    Returns False when another Modus instance holds it, which the caller must
+    surface as "another instance is running".  Fail-soft: if the lease cannot
+    be taken for environmental reasons (no fcntl/msvcrt, unwritable dir) it
+    returns True so a headless/server context is never blocked.
+    """
+    global _writer_lease
+    if _writer_lease is not None:
+        return True
+    lease = _WriterLease(_lock_path())
+    if not lease.acquire():
+        return False
+    _writer_lease = lease
+    return True
+
+
+def release_writer_lease() -> None:
+    """Drop the process's writer lease, if it holds one (idempotent)."""
+    global _writer_lease
+    if _writer_lease is not None:
+        lease = _writer_lease
+        _writer_lease = None
+        lease.release()
+
 
 # True once the process has validated the database at least once (startup
 # quick_check).  Tests that swap ``DB_PATH`` per-case reset it explicitly.
@@ -29,6 +218,124 @@ _recovering = False
 # Periodic WAL checkpoint cadence (approximate, per _get_conn open).
 _checkpoint_calls = 0
 _CHECKPOINT_EVERY = 128
+
+
+def _trajectory_default(value: Any) -> Any:
+    """JSON fallback for trajectory serialization (dataclass-aware).
+
+    Keeps ``persist_trajectory`` and the tool-call fingerprint writer safe for
+    dataclass payloads (e.g. ``ToolResult``) without leaking a repr that a later
+    ``json.dumps`` could not round-trip.
+    """
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: getattr(value, field.name)
+            for field in fields(value)
+            if hasattr(value, field.name)
+        }
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(item) for item in value)
+    if isinstance(value, (Path,)):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    return str(value)
+
+
+def _summarize_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    """Fold one tool call into a bounded, fingerprintable trajectory summary.
+
+    The raw input/output payloads are redacted and capped so the durable ledger
+    stays bounded; the ``sha256`` of the *original* call makes the summary
+    verifiable without re-running the agent.  Used by ``upsert_run_event`` /
+    ``settle_run_event`` to give every run_events row an evaluable ``tool_calls``
+    column.
+    """
+    if not isinstance(call, dict):
+        call = {"raw": call}
+    name = str(call.get("name") or call.get("function", {}).get("name") or call.get("id") or "tool")
+    raw_input = call.get("input")
+    if not isinstance(raw_input, dict) and isinstance(raw_input, str):
+        try:
+            raw_input = json.loads(raw_input)
+        except (TypeError, json.JSONDecodeError):
+            raw_input = {"value": raw_input}
+    if not isinstance(raw_input, dict):
+        raw_input = {"value": raw_input}
+    result = call.get("result")
+    if isinstance(result, dict):
+        display = str(result.get("display_summary") or result.get("text") or result.get("output") or "")
+    elif isinstance(result, str):
+        display = result
+    else:
+        display = str(result or "")
+    output = str(call.get("output") or call.get("display_summary") or display or "")
+    fingerprint = hashlib.sha256(
+        json.dumps(call, ensure_ascii=False, sort_keys=True, default=_trajectory_default).encode("utf-8"),
+    ).hexdigest()
+    return {
+        "name": name,
+        "input_summary": str(redact_dict(raw_input) if isinstance(raw_input, dict) else raw_input)[:1000],
+        "output_summary": str(redact_text(output))[:1000],
+        "sha256": fingerprint,
+    }
+
+
+def _extract_tool_calls(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect evaluable tool-call summaries for one Agent event.
+
+    Prefers the explicit ``payload.tool_calls`` list (already summarized by the
+    emitter) and falls back to deriving one summary from a tool_call/tool_result
+    payload, so a minimal hand-built event still yields an evaluable trajectory.
+    """
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        explicit = payload.get("tool_calls")
+        if isinstance(explicit, list):
+            return [_summarize_tool_call(call) for call in explicit]
+        if "tool_call_id" in payload:
+            return [_summarize_tool_call(payload)]
+    return []
+
+
+def _final_result_text(event_type: str, payload: dict[str, Any],
+                       *, conn: sqlite3.Connection | None = None,
+                       run_id: str = "") -> str:
+    """Derive the run's textual outcome for the ``final_result`` column.
+
+    Priority:
+    1. the terminal payload's ``message`` (run_error message, or a completion
+       message when the caller supplied one);
+    2. the latest ``host_response`` ``markdown``/``text`` already persisted in
+       run_events (the agent's answer to the user's request) — queried on the
+       settlement connection when provided;
+    3. a ``text`` fallback on the completed payload itself.
+    """
+    message = str(payload.get("message") or "").strip()
+    if message:
+        return message
+    if conn is not None and run_id:
+        try:
+            row = conn.execute(
+                """SELECT payload FROM run_events
+                   WHERE run_id=? AND type='host_response'
+                   ORDER BY sequence ASC, event_id ASC""",
+                (run_id,),
+            ).fetchall()
+            for r in reversed(row):
+                try:
+                    data = json.loads(r["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    data = {}
+                if isinstance(data, dict):
+                    text = str(data.get("markdown") or data.get("text") or "").strip()
+                    if text:
+                        return text
+        except sqlite3.Error:
+            pass
+    if event_type == "run_completed":
+        return str(payload.get("text") or "").strip()
+    return ""
 
 
 def _raw_conn() -> sqlite3.Connection:
@@ -57,6 +364,282 @@ def checkpoint_now() -> int:
             return int(row[2]) if row else 0
     except sqlite3.Error:
         return 0
+
+
+def _backup_before_migrate(target_version: int) -> None:
+    """Atomically snapshot desktop.db before a migration.
+
+    Uses SQLite's online backup API so the copy is guaranteed consistent even
+    mid-WAL.  A partial copy is never renamed into place, so the previous good
+    backup is preserved on failure.  Best-effort: a migration that cannot back
+    up still proceeds so a read-only data directory never blocks the migration
+    itself.
+    """
+    if not DB_PATH.exists():
+        return
+    backup_dir = DB_DIR / "backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    dest = backup_dir / f"db-v{target_version}.bak"
+    if dest.exists():
+        return
+    # A brand-new database (opened but never populated) has nothing worth
+    # backing up; only snapshot once schema tables already exist.
+    try:
+        probe = sqlite3.connect(str(DB_PATH))
+        try:
+            has_tables = bool(probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1",
+            ).fetchone())
+        finally:
+            probe.close()
+    except sqlite3.Error:
+        has_tables = True
+    if not has_tables:
+        return
+    tmp = dest.with_suffix(".bak.tmp")
+    try:
+        with suppress(OSError):
+            tmp.unlink()
+        src = sqlite3.connect(str(DB_PATH))
+        dst = sqlite3.connect(str(tmp))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        os.replace(tmp, dest)
+    except (sqlite3.Error, OSError) as exc:
+        with suppress(OSError):
+            tmp.unlink()
+        logger.warning(
+            "schema migration backup to %s failed (%s); continuing", dest, exc,
+        )
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """Version 2: absorb every column evolution from the pre-version era.
+
+    The base schema script creates the full modern table shapes, so on a fresh
+    database these adds are all no-ops.  On a genuine v1 (pre-version)
+    database they add the columns the codebase used to add ad hoc, then
+    rebuild the secondary indexes and backfill the workspace/owner identity
+    the same way ``init_db`` always did — preserving user history in place.
+    """
+    for table, column, declaration in _MIGRATIONS_V2_COLUMNS:
+        _ensure_column(conn, table, column, declaration)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_events_task ON run_events(task_id, sequence)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id, updated_at DESC)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_workspace ON runs(workspace_id, started_at DESC)",
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_runs_client_request")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id, updated_at DESC)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at DESC)",
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client_request
+           ON runs(owner_id, client_request_id)
+           WHERE client_request_id IS NOT NULL AND client_request_id != ''""",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_billing_user ON billing_ledger(user_id, created_at)",
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_run
+           ON billing_ledger(user_id, run_id)
+           WHERE kind='charge'""",
+    )
+    _backfill_identity(conn)
+
+
+_MIGRATIONS_V2_COLUMNS: list[tuple[str, str, str]] = [
+    ("sessions", "workspace_id", "TEXT"),
+    ("runs", "workspace_id", "TEXT"),
+    ("runs", "client_request_id", "TEXT"),
+    ("runs", "client_request_fingerprint", "TEXT"),
+    ("runs", "projection_revision", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_events", "workspace_id", "TEXT"),
+    ("run_events", "task_id", "TEXT"),
+    ("run_events", "artifact_ids", "TEXT NOT NULL DEFAULT '[]'"),
+    ("run_events", "schema", "TEXT NOT NULL DEFAULT 'modus.agent-event.v2'"),
+    ("run_tasks", "task_kind", "TEXT NOT NULL DEFAULT 'worker'"),
+    ("run_tasks", "depth", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_tasks", "actor_id", "TEXT NOT NULL DEFAULT ''"),
+    ("run_tasks", "actor_label", "TEXT NOT NULL DEFAULT ''"),
+    ("memories", "embedding", "TEXT"),
+    ("context_compactions", "cutoff_message_id", "INTEGER"),
+    ("messages", "tool_call_id", "TEXT"),
+    ("sessions", "owner_id", "TEXT"),
+    ("runs", "owner_id", "TEXT"),
+    ("workspaces", "owner_id", "TEXT"),
+    ("account_workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """Version 3: make run_events an evaluable trajectory (Wave5 E1).
+
+    ``run_events`` already records the ``modus.agent-event.v2`` stream; v3 adds
+    the fields that let an offline Evaluator join a scenario against a run
+    without re-running the agent:
+    - ``tool_calls``: a JSON summary of the tool calls that produced this event
+      (name / input / output摘要 + sha256 fingerprint of the full call), so a
+      trajectory is self-describing even after the terminal budget snapshot
+      replaces individual tool payloads.
+    - ``objective`` (runs): the user request the run was admitted for, used as
+      the scenario reference point by ``modus evaluate``.
+    - ``final_result`` (runs): the run's textual outcome (the terminal event
+      message or the final host_response) so a scenario can score the answer
+      even when the run failed.
+    """
+    for table, column, declaration in _MIGRATIONS_V3_COLUMNS:
+        _ensure_column(conn, table, column, declaration)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_events_toolcalls ON run_events(tool_calls)",
+    )
+
+
+_MIGRATIONS_V3_COLUMNS: list[tuple[str, str, str]] = [
+    ("run_events", "tool_calls", "TEXT NOT NULL DEFAULT '[]'"),
+    ("runs", "objective", "TEXT NOT NULL DEFAULT ''"),
+    ("runs", "final_result", "TEXT NOT NULL DEFAULT ''"),
+]
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """Version 4: session tree fields on ``messages`` + branch leaf pointer.
+
+    Wave5 E3 turns the linear message log into a tree.  On a fresh database
+    the base schema script already creates these columns and the
+    ``session_branches`` table, so every ALTER below is a no-op; on a genuine
+    v3 database they are added in place.  No rows are rewritten and no
+    per-session anchor is seeded: ``current_session_leaf`` falls back to the
+    newest message when no branch row exists, which keeps every pre-existing
+    linear history on the implicit mainline.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS session_branches (
+               branch_id TEXT PRIMARY KEY,
+               session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               message_id INTEGER NOT NULL,
+               branch_root_id INTEGER,
+               created_at REAL NOT NULL
+           )""",
+    )
+    for table, column, declaration in _MIGRATIONS_V4_COLUMNS:
+        _ensure_column(conn, table, column, declaration)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_branches_session "
+        "ON session_branches(session_id, created_at DESC)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_branch ON messages(branch_root_id, id)",
+    )
+
+
+_MIGRATIONS_V4_COLUMNS: list[tuple[str, str, str]] = [
+    ("messages", "parent_message_id", "INTEGER"),
+    ("messages", "branch_root_id", "INTEGER"),
+]
+
+
+_MIGRATIONS: list[tuple[int, Any]] = [
+    (2, _migrate_v2),
+    (3, _migrate_v3),
+    (4, _migrate_v4),
+]
+
+
+def _backfill_identity(conn: sqlite3.Connection) -> None:
+    """Backfill workspace/owner identity onto pre-version rows, as init_db did."""
+    from modus.desktop.workspace import WorkspaceIdentity
+
+    workspace = WorkspaceIdentity.current()
+    now = time.time()
+    conn.execute(
+        """INSERT INTO workspaces (workspace_id, root, name, created_at, updated_at)
+           VALUES (?,?,?,?,?) ON CONFLICT(root) DO UPDATE SET
+           name=excluded.name, updated_at=excluded.updated_at""",
+        (workspace.workspace_id, workspace.root, workspace.name, now, now),
+    )
+    conn.execute(
+        "UPDATE sessions SET workspace_id=? WHERE workspace_id IS NULL OR workspace_id=''",
+        (workspace.workspace_id,),
+    )
+    conn.execute(
+        """UPDATE runs SET workspace_id=(
+               SELECT sessions.workspace_id FROM sessions WHERE sessions.id=runs.session_id
+           ) WHERE workspace_id IS NULL OR workspace_id=''""",
+    )
+    conn.execute(
+        """UPDATE run_events SET workspace_id=(
+               SELECT runs.workspace_id FROM runs WHERE runs.run_id=run_events.run_id
+           ) WHERE workspace_id IS NULL OR workspace_id=''""",
+    )
+
+    from modus.desktop import accounts
+
+    default_user = accounts.ensure_default_user(conn=conn)
+    default_owner = str(default_user["user_id"])
+    conn.execute(
+        "UPDATE sessions SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
+        (default_owner,),
+    )
+    conn.execute(
+        "UPDATE runs SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
+        (default_owner,),
+    )
+    conn.execute(
+        "UPDATE workspaces SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
+        (default_owner,),
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO account_workspaces
+           (owner_id, workspace_id, created_at, updated_at)
+           SELECT owner_id, workspace_id, created_at, updated_at
+           FROM workspaces WHERE owner_id IS NOT NULL AND owner_id != ''""",
+    )
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Walk desktop.db forward to ``SCHEMA_VERSION`` using ``PRAGMA user_version``.
+
+    Version 0 or 1 (an unversioned pre-T4 database) is treated as version 1
+    so existing history migrates in place rather than being rebuilt.  Each
+    step is backed up to ``~/.modus/backup/db-v{n}.bak`` before it runs and is
+    committed in one transaction together with its ``user_version`` bump, so a
+    crash never leaves a database stamped with a version whose schema half
+    applied.  A database stamped newer than the current code is refused with an
+    explicit error — never silently downgraded.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(
+            "database schema version {} is newer than this build supports ({}) — "
+            "拒绝打开：数据库来自更新版本，请升级 Modus 后再打开".format(version, SCHEMA_VERSION)
+        )
+    if version >= SCHEMA_VERSION:
+        return
+    starting = version or 1
+    for target, apply in _MIGRATIONS:
+        if target <= starting:
+            continue
+        _backup_before_migrate(target)
+        conn.execute("BEGIN")
+        try:
+            apply(conn)
+            conn.execute(f"PRAGMA user_version={int(target)}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        logger.info("desktop.db migrated to schema v%s", target)
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -351,7 +934,26 @@ def prune_expired(
 
 
 def init_db() -> None:
-    """建表（幂等）"""
+    """建表（幂等），并把 schema 演进收敛到版本化迁移。
+
+    ``PRAGMA user_version`` 是演进权威：启动先拒绝来自更新版本的数据库
+    （绝不静默降级），再建表，最后 ``migrate_schema`` 逐个前向迁移并迁移前
+    备份到 ``~/.modus/backup/db-v{n}.bak``。
+    """
+    if DB_PATH.exists():
+        try:
+            probe = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+            try:
+                version = int(probe.execute("PRAGMA user_version").fetchone()[0] or 0)
+            finally:
+                probe.close()
+        except sqlite3.DatabaseError:
+            version = 0
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                "database schema version {} is newer than this build supports ({}) — "
+                "拒绝打开：数据库来自更新版本，请升级 Modus 后再打开".format(version, SCHEMA_VERSION)
+            )
     with _get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS workspaces (
@@ -383,6 +985,15 @@ def init_db() -> None:
                 content TEXT NOT NULL DEFAULT '',
                 tool_calls TEXT NOT NULL DEFAULT '[]',
                 token_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                parent_message_id INTEGER,
+                branch_root_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS session_branches (
+                branch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_id INTEGER NOT NULL,
+                branch_root_id INTEGER,
                 created_at REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS context_compactions (
@@ -413,7 +1024,8 @@ def init_db() -> None:
                 part_id TEXT NOT NULL DEFAULT '',
                 artifact_ids TEXT NOT NULL DEFAULT '[]',
                 schema TEXT NOT NULL DEFAULT 'modus.agent-event.v2',
-                revision INTEGER NOT NULL DEFAULT 0
+                revision INTEGER NOT NULL DEFAULT 0,
+                tool_calls TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
@@ -428,6 +1040,8 @@ def init_db() -> None:
                 config_snapshot TEXT NOT NULL DEFAULT '{}',
                 budget TEXT NOT NULL DEFAULT '{}',
                 error TEXT,
+                objective TEXT NOT NULL DEFAULT '',
+                final_result TEXT NOT NULL DEFAULT '',
                 started_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 ended_at REAL
@@ -495,6 +1109,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_run_events_session ON run_events(session_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_session_branches_session
+                ON session_branches(session_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_compactions_session
                 ON context_compactions(session_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, started_at DESC);
@@ -553,121 +1169,11 @@ def init_db() -> None:
                 created_at REAL NOT NULL
             );
         """)
-        # Existing Desktop databases predate workspace/task identity. SQLite's
-        # CREATE TABLE IF NOT EXISTS does not add columns, so evolve them here
-        # without replacing user-owned history.
-        _ensure_column(conn, "sessions", "workspace_id", "TEXT")
-        _ensure_column(conn, "runs", "workspace_id", "TEXT")
-        _ensure_column(conn, "runs", "client_request_id", "TEXT")
-        _ensure_column(conn, "runs", "client_request_fingerprint", "TEXT")
-        _ensure_column(
-            conn, "runs", "projection_revision", "INTEGER NOT NULL DEFAULT 0",
-        )
-        _ensure_column(conn, "run_events", "workspace_id", "TEXT")
-        _ensure_column(conn, "run_events", "task_id", "TEXT")
-        _ensure_column(conn, "run_events", "artifact_ids", "TEXT NOT NULL DEFAULT '[]'")
-        _ensure_column(
-            conn, "run_events", "schema",
-            "TEXT NOT NULL DEFAULT 'modus.agent-event.v2'",
-        )
-        _ensure_column(conn, "run_tasks", "task_kind", "TEXT NOT NULL DEFAULT 'worker'")
-        _ensure_column(conn, "run_tasks", "depth", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "run_tasks", "actor_id", "TEXT NOT NULL DEFAULT ''")
-        _ensure_column(conn, "run_tasks", "actor_label", "TEXT NOT NULL DEFAULT ''")
-        _ensure_column(conn, "memories", "embedding", "TEXT")
-        _ensure_column(conn, "context_compactions", "cutoff_message_id", "INTEGER")
-        # tool results must keep the id of the assistant tool_call they answer;
-        # OpenAI-compatible providers reject a tool message without a matching
-        # tool_call_id (HTTP 400). Older rows predate the column and are paired
-        # positionally at restore time.
-        _ensure_column(conn, "messages", "tool_call_id", "TEXT")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_run_events_task ON run_events(task_id, sequence)",
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id, updated_at DESC)",
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runs_workspace ON runs(workspace_id, started_at DESC)",
-        )
-        # Request idempotency is account-local. The former global index let an
-        # unrelated account block the same client request ID.
-        conn.execute("DROP INDEX IF EXISTS idx_runs_client_request")
-
-        from modus.desktop.workspace import WorkspaceIdentity
-
-        workspace = WorkspaceIdentity.current()
-        now = time.time()
-        conn.execute(
-            """INSERT INTO workspaces (workspace_id, root, name, created_at, updated_at)
-               VALUES (?,?,?,?,?) ON CONFLICT(root) DO UPDATE SET
-               name=excluded.name, updated_at=excluded.updated_at""",
-            (workspace.workspace_id, workspace.root, workspace.name, now, now),
-        )
-        conn.execute(
-            "UPDATE sessions SET workspace_id=? WHERE workspace_id IS NULL OR workspace_id=''",
-            (workspace.workspace_id,),
-        )
-        conn.execute(
-            """UPDATE runs SET workspace_id=(
-                   SELECT sessions.workspace_id FROM sessions WHERE sessions.id=runs.session_id
-               ) WHERE workspace_id IS NULL OR workspace_id=''""",
-        )
-        conn.execute(
-            """UPDATE run_events SET workspace_id=(
-                   SELECT runs.workspace_id FROM runs WHERE runs.run_id=run_events.run_id
-               ) WHERE workspace_id IS NULL OR workspace_id=''""",
-        )
-
-        # ── User ownership (local multi-account). No foreign keys: isolation is
-        # enforced at the query layer (session catalog / run admission filter by
-        # owner_id). Existing rows are backfilled to the local default user.
-        _ensure_column(conn, "sessions", "owner_id", "TEXT")
-        _ensure_column(conn, "runs", "owner_id", "TEXT")
-        _ensure_column(conn, "workspaces", "owner_id", "TEXT")
-        _ensure_column(conn, "account_workspaces", "is_default", "INTEGER NOT NULL DEFAULT 0")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id, updated_at DESC)",
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at DESC)",
-        )
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client_request
-               ON runs(owner_id, client_request_id)
-               WHERE client_request_id IS NOT NULL AND client_request_id != ''""",
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_billing_user ON billing_ledger(user_id, created_at)",
-        )
-        conn.execute(
-            """CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_run
-               ON billing_ledger(user_id, run_id)
-               WHERE kind='charge'""",
-        )
-
-        from modus.desktop import accounts
-
-        default_user = accounts.ensure_default_user(conn=conn)
-        default_owner = str(default_user["user_id"])
-        conn.execute(
-            "UPDATE sessions SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
-            (default_owner,),
-        )
-        conn.execute(
-            "UPDATE runs SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
-            (default_owner,),
-        )
-        conn.execute(
-            "UPDATE workspaces SET owner_id=? WHERE owner_id IS NULL OR owner_id=''",
-            (default_owner,),
-        )
-        conn.execute(
-            """INSERT OR IGNORE INTO account_workspaces
-               (owner_id, workspace_id, created_at, updated_at)
-               SELECT owner_id, workspace_id, created_at, updated_at
-               FROM workspaces WHERE owner_id IS NOT NULL AND owner_id != ''""",
-        )
+        # Schema evolution is versioned and transactional: ``migrate_schema``
+        # walks ``PRAGMA user_version`` forward through ``_MIGRATIONS``,
+        # backing up before each step, and backfills workspace/owner identity
+        # exactly as the ad-hoc ``_ensure_column`` calls below used to.
+        migrate_schema(conn)
 
 
 def _ensure_column(
@@ -832,6 +1338,7 @@ def create_run(
     workspace_id: str = "",
     client_request_id: str = "",
     client_request_fingerprint: str = "",
+    objective: str = "",
 ) -> dict[str, Any]:
     """Create one run and freeze its start-time configuration exactly once."""
     now = time.time()
@@ -852,13 +1359,13 @@ def create_run(
             """INSERT OR IGNORE INTO runs
                (run_id, session_id, client_request_id, client_request_fingerprint,
                 workspace_id, owner_id, mode, state, projection_revision,
-                config_snapshot, started_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                config_snapshot, objective, started_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id, session_id, client_request_id or None,
                 client_request_fingerprint or None, workspace_id or None,
                 owner_id or None, normalize_mode(mode),
-                "running", 0, snapshot, now, now,
+                "running", 0, snapshot, str(objective or ""), now, now,
             ),
         )
     return get_run(run_id) or {}
@@ -875,6 +1382,7 @@ def create_run_admission(
     root_actor_id: str = "primary",
     root_actor_label: str = "Host",
     assigned_model_id: str = "",
+    objective: str = "",
 ) -> dict[str, Any]:
     """Atomically create the durable Run and its running canonical root.
 
@@ -921,13 +1429,14 @@ def create_run_admission(
                 """INSERT INTO runs
                    (run_id, session_id, client_request_id,
                     client_request_fingerprint, workspace_id, owner_id, mode, state,
-                    projection_revision, config_snapshot, started_at,
+                    projection_revision, config_snapshot, objective, started_at,
                     updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id, session_id, client_request_id or None,
                     client_request_fingerprint or None, workspace_id or None,
-                    owner_id or None, normalized_mode, "running", 0, snapshot, now, now,
+                    owner_id or None, normalized_mode, "running", 0, snapshot,
+                    str(objective or ""), now, now,
                 ),
             )
             root_cursor = conn.execute(
@@ -1177,15 +1686,17 @@ def settle_run_event(session_id: str, event: dict[str, Any]) -> bool:
         )
         if task_cursor.rowcount != 1:
             return False
+        final_result = _final_result_text(event_type, payload, conn=conn, run_id=run_id)
         cursor = conn.execute(
             """UPDATE runs SET state=?, stop_reason=?, budget=?, error=?,
-               updated_at=?, ended_at=?, projection_revision=projection_revision+1
+               final_result=?, updated_at=?, ended_at=?,
+               projection_revision=projection_revision+1
                WHERE run_id=? AND state NOT IN ('completed','failed','cancelled','interrupted')""",
             (
                 run_state, stop_reason,
                 json.dumps(redact_dict(payload.get("budget") or {}), ensure_ascii=False, sort_keys=True),
                 str(payload.get("message") or "") or None,
-                now, now, run_id,
+                final_result, now, now, run_id,
             ),
         )
         if cursor.rowcount != 1:
@@ -1237,8 +1748,8 @@ def settle_run_event(session_id: str, event: dict[str, Any]) -> bool:
             """INSERT INTO run_events
                (event_id, run_id, session_id, workspace_id, task_id, sequence,
                 timestamp, channel_id, parent_event_id, actor, type, status,
-                payload, mode, part_id, artifact_ids, schema, revision)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                payload, mode, part_id, artifact_ids, schema, revision, tool_calls)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 str(event["event_id"]), run_id, str(session_id),
                 str(event.get("workspace_id") or "") or None,
@@ -1251,11 +1762,18 @@ def settle_run_event(session_id: str, event: dict[str, Any]) -> bool:
                 json.dumps(list(event.get("artifact_ids") or []), ensure_ascii=False),
                 str(event.get("schema") or "modus.agent-event.v2"),
                 int(event.get("revision") or 0),
+                json.dumps(_extract_tool_calls(event), ensure_ascii=False),
             ),
         )
         if task_cursor.rowcount:
             _bump_run_projection(conn, run_id)
         _bump_run_projection(conn, run_id)
+    # Sink the evaluable trajectory once the terminal state is durable.  A
+    # storage failure must never make a successfully settled run look unsettled.
+    try:
+        persist_trajectory(run_id)
+    except Exception:
+        logger.warning("trajectory sink failed for settled run %s", run_id)
     return True
 
 
@@ -1373,8 +1891,9 @@ def interrupt_nonterminal_runs() -> int:
                 """INSERT OR IGNORE INTO run_events
                    (event_id, run_id, session_id, workspace_id, task_id, sequence,
                     timestamp, channel_id, parent_event_id, actor, type, status,
-                    payload, mode, part_id, artifact_ids, schema, revision)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    payload, mode, part_id, artifact_ids, schema, revision,
+                    tool_calls)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     f"evt_restart_{event_uuid}", run_id, str(run["session_id"]),
                     str(run["workspace_id"] or "") or None,
@@ -1393,17 +1912,25 @@ def interrupt_nonterminal_runs() -> int:
                         ensure_ascii=False, sort_keys=True,
                     ),
                     normalize_mode(run["mode"]), f"part_restart_{event_uuid}",
-                    "[]", "modus.agent-event.v2", 0,
+                    "[]", "modus.agent-event.v2", 0, "[]",
                 ),
             )
             if event_cursor.rowcount == 1:
                 _bump_run_projection(conn, run_id)
         cursor = conn.execute(
             """UPDATE runs SET state='interrupted', stop_reason='process_restart',
-               error=?, updated_at=?, ended_at=?,
+               error=?, final_result=?, updated_at=?, ended_at=?,
                projection_revision=projection_revision+1 WHERE state='running'""",
-            (message, now, now),
+            (message, message, now, now),
         )
+    # Sink the interrupted runs' trajectories after the transaction commits so
+    # an evaluator can still score where the work died.  Best-effort: a storage
+    # failure never affects the settlement already committed.
+    for run in interrupted:
+        try:
+            persist_trajectory(str(run["run_id"]))
+        except Exception:
+            logger.warning("trajectory sink failed for interrupted run %s", run["run_id"])
     return cursor.rowcount
 
 
@@ -1731,8 +2258,8 @@ def upsert_run_event(session_id: str, event: dict[str, Any]) -> None:
             """INSERT INTO run_events
                (event_id, run_id, session_id, workspace_id, task_id, sequence,
                 timestamp, channel_id, parent_event_id, actor, type, status,
-                payload, mode, part_id, artifact_ids, schema, revision)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                payload, mode, part_id, artifact_ids, schema, revision, tool_calls)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(event_id) DO UPDATE SET
                  run_id=excluded.run_id,
                  session_id=excluded.session_id,
@@ -1750,7 +2277,8 @@ def upsert_run_event(session_id: str, event: dict[str, Any]) -> None:
                  part_id=excluded.part_id,
                  artifact_ids=excluded.artifact_ids,
                  schema=excluded.schema,
-                 revision=excluded.revision
+                 revision=excluded.revision,
+                 tool_calls=excluded.tool_calls
                WHERE excluded.revision >= run_events.revision
             """,
             (
@@ -1767,6 +2295,7 @@ def upsert_run_event(session_id: str, event: dict[str, Any]) -> None:
                 json.dumps(list(event.get("artifact_ids") or []), ensure_ascii=False),
                 str(event.get("schema") or "modus.agent-event.v2"),
                 int(event.get("revision") or 0),
+                json.dumps(_extract_tool_calls(event), ensure_ascii=False),
             ),
         )
         if cursor.rowcount == 1:
@@ -1777,23 +2306,32 @@ def upsert_run_event(session_id: str, event: dict[str, Any]) -> None:
                 _bump_run_projection(conn, prior_run_id)
 
 
+def _decode_run_event(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """Decode one run_events row into its typed wire shape.
+
+    Decodes the JSON columns (actor / payload / artifact_ids / tool_calls) and
+    normalizes the mode so consumers — including the offline Evaluator — see the
+    same shape regardless of whether the row was read from SQLite or from a
+    persisted trajectory file.
+    """
+    event = dict(row)
+    event["mode"] = normalize_mode(event.get("mode"))
+    for key in ("actor", "payload", "artifact_ids", "tool_calls"):
+        default = "[]" if key in ("artifact_ids", "tool_calls") else "{}"
+        try:
+            event[key] = json.loads(event[key] or default)
+        except (TypeError, json.JSONDecodeError):
+            event[key] = [] if key in ("artifact_ids", "tool_calls") else {}
+    return event
+
+
 def get_run_events(run_id: str) -> list[dict[str, Any]]:
     """Return the latest audited event state in deterministic timeline order."""
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM run_events WHERE run_id=? ORDER BY sequence ASC, event_id ASC", (run_id,),
         ).fetchall()
-    events: list[dict[str, Any]] = []
-    for row in rows:
-        event = dict(row)
-        event["mode"] = normalize_mode(event.get("mode"))
-        for key in ("actor", "payload", "artifact_ids"):
-            try:
-                event[key] = json.loads(event[key] or ("[]" if key == "artifact_ids" else "{}"))
-            except (TypeError, json.JSONDecodeError):
-                event[key] = [] if key == "artifact_ids" else {}
-        events.append(event)
-    return events
+    return [_decode_run_event(row) for row in rows]
 
 
 def get_run_events_since(run_id: str, since_sequence: int = 0) -> list[dict[str, Any]]:
@@ -1812,17 +2350,7 @@ def get_run_events_since(run_id: str, since_sequence: int = 0) -> list[dict[str,
             "ORDER BY sequence ASC, event_id ASC",
             (run_id, bounded),
         ).fetchall()
-    events: list[dict[str, Any]] = []
-    for row in rows:
-        event = dict(row)
-        event["mode"] = normalize_mode(event.get("mode"))
-        for key in ("actor", "payload", "artifact_ids"):
-            try:
-                event[key] = json.loads(event[key] or ("[]" if key == "artifact_ids" else "{}"))
-            except (TypeError, json.JSONDecodeError):
-                event[key] = [] if key == "artifact_ids" else {}
-        events.append(event)
-    return events
+    return [_decode_run_event(row) for row in rows]
 
 
 def get_run_event_cursor(run_id: str) -> int:
@@ -1838,6 +2366,155 @@ def get_run_event_cursor(run_id: str) -> int:
 def get_latest_session_run_events(session_id: str) -> list[dict[str, Any]]:
     run = latest_run_for_session(session_id)
     return get_run_events(str(run["run_id"])) if run else []
+
+
+# ── Trajectory persistence (Wave5 E1) ──
+
+_TRAJECTORY_SUBDIR = "trajectories"
+_TRAJECTORY_FILE_VERSION = 1
+
+
+def trajectory_dir() -> Path:
+    """Return Modus's private trajectory store (``~/.modus/trajectories``)."""
+    return DB_DIR / _TRAJECTORY_SUBDIR
+
+
+def _trajectory_file(run_id: str) -> Path:
+    return trajectory_dir() / f"{run_id}.json"
+
+
+def _trajectory_event(sequence: int, event: dict[str, Any]) -> dict[str, Any]:
+    """Project one decoded run_event onto the on-disk trajectory shape.
+
+    Only the fields the offline Evaluator needs are kept, and everything is
+    JSON-safe: the actor/payload are redacted on write, tool_calls is already a
+    summarized list, and non-JSON payload values are coerced through
+    ``_trajectory_default`` so a dataclass-bearing payload never breaks the
+    sink.
+    """
+    actor = event.get("actor") or {}
+    payload = event.get("payload") or {}
+    return {
+        "sequence": int(sequence),
+        "event_id": str(event.get("event_id") or ""),
+        "type": str(event.get("type") or ""),
+        "status": str(event.get("status") or ""),
+        "timestamp": str(event.get("timestamp") or ""),
+        "actor": actor,
+        "tool_calls": list(event.get("tool_calls") or []),
+        "payload": json.loads(
+            json.dumps(redact_dict(payload), ensure_ascii=False, default=_trajectory_default)
+        ) if isinstance(payload, dict) else payload,
+    }
+
+
+def _trajectory_objective(run: dict[str, Any] | None, events: list[dict[str, Any]]) -> str:
+    """Resolve the trajectory's objective.
+
+    Prefers the durable ``runs.objective`` (written by ``create_run`` when the
+    caller supplies it) and falls back to the first ``user_message`` payload —
+    the user's own request — so a trajectory is self-describing even when the
+    run admission did not pass an explicit objective.
+    """
+    objective = str((run or {}).get("objective") or "").strip()
+    if objective:
+        return objective
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("type") or "") != "user_message":
+            continue
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("markdown") or payload.get("text") or "").strip()
+        if text:
+            return text[:500]
+    return ""
+
+
+def persist_trajectory(run_id: str, *, run: dict[str, Any] | None = None,
+                       events: list[dict[str, Any]] | None = None) -> Path | None:
+    """Sink one run's evaluable trajectory to ``~/.modus/trajectories/{run_id}.json``.
+
+    Called after a run reaches a terminal state.  Re-serialization is
+    idempotent (same run_id overwrites the same file), best-effort (a storage
+    failure never raises), and bounded to Modus's own data directory — the
+    trajectory store never touches the user's workspace.
+
+    ``run``/``events`` default to a live read of the ledger so callers can pass
+    either a freshly settled envelope or nothing and still get a correct file.
+    """
+    if not run_id:
+        return None
+    if run is None:
+        run = get_run(run_id)
+    if events is None:
+        events = get_run_events(run_id)
+    try:
+        _trajectory_file(run_id).parent.mkdir(parents=True, exist_ok=True)
+        doc = {
+            "schema": "modus.trajectory.v1",
+            "file_version": _TRAJECTORY_FILE_VERSION,
+            "run_id": run_id,
+            "state": str((run or {}).get("state") or ""),
+            "stop_reason": str((run or {}).get("stop_reason") or "") or None,
+            "mode": normalize_mode((run or {}).get("mode")),
+            "objective": _trajectory_objective(run, events),
+            "final_result": str((run or {}).get("final_result") or ""),
+            "budget": (run or {}).get("budget") or {},
+            "created_at": time.time(),
+            "events": [
+                _trajectory_event(int(event.get("sequence") or index), event)
+                for index, event in enumerate(events)
+            ],
+        }
+        with open(_trajectory_file(run_id), "w", encoding="utf-8") as handle:
+            json.dump(doc, handle, ensure_ascii=False, indent=2, default=_trajectory_default)
+        return _trajectory_file(run_id)
+    except OSError:
+        logger.warning("trajectory sink failed for run %s", run_id)
+        return None
+
+
+def load_trajectory(run_id: str) -> dict[str, Any] | None:
+    """Read a persisted trajectory back as a plain dict, or None when absent."""
+    path = _trajectory_file(run_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    doc["events"] = [
+        event for event in doc.get("events") or []
+        if isinstance(event, dict)
+    ]
+    return doc
+
+
+def list_trajectories() -> list[dict[str, Any]]:
+    """Return every persisted trajectory in Modus's private store.
+
+    Each entry is the trajectory doc (run_id, state, objective, final_result,
+    event count); malformed files are skipped, never raised.
+    """
+    store = trajectory_dir()
+    if not store.exists():
+        return []
+    result: list[dict[str, Any]] = []
+    for path in sorted(store.glob("*.json")):
+        doc = load_trajectory(path.stem)
+        if doc is None:
+            continue
+        result.append(doc)
+    return result
+
+
+
 
 
 def create_context_compaction(
@@ -2082,22 +2759,352 @@ def delete_session(session_id: str) -> None:
 
 # ── Message CRUD ──
 
-def add_message(session_id: str, role: str, content: str = "", tool_calls: list | None = None, token_count: int = 0, tool_call_id: str | None = None) -> None:
+def add_message(session_id: str, role: str, content: str = "", tool_calls: list | None = None, token_count: int = 0, tool_call_id: str | None = None, *, parent_id: int | None = None, parent_message_id: int | None = None) -> None:
+    """Persist one message row, optionally on a session-tree branch.
+
+    ``parent_id`` (aliased ``parent_message_id`` for callers that speak the
+    column name) is the row this message continues from.  When omitted, the
+    message is appended to the session's current leaf — which is the mainline
+    for a linear history and the active branch's leaf after a branch/revert.
+    ``parent_message_id`` defaults to that resolved parent; ``branch_root_id``
+    is inherited from the parent row (NULL stays mainline).  A message that
+    carries tool results is never chosen as a branch root, so a branch always
+    starts at a user/assistant boundary (invertible and tool-call-safe).
+    """
     if token_count <= 0:
         # Populate the audit token estimate so the durable ledger is usable
         # for budgeting and restore decisions without trusting caller call
         # sites to remember to fill it.  A zero/omitted count means "estimate".
         token_count = _estimate_message_tokens(role, content, tool_calls or [])
+    parent = parent_id if parent_id is not None else parent_message_id
     with _get_conn() as conn:
         try:
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, tool_calls, token_count, created_at, tool_call_id) VALUES (?,?,?,?,?,?,?)",
-                (session_id, role, content, json.dumps(tool_calls or []), token_count, time.time(), tool_call_id or None),
+            if parent is not None:
+                parent_row = conn.execute(
+                    "SELECT id, branch_root_id FROM messages WHERE id=? AND session_id=?",
+                    (int(parent), session_id),
+                ).fetchone()
+                if parent_row is None:
+                    return
+                parent_id_resolved = int(parent_row["id"])
+                branch_root = parent_row["branch_root_id"]
+            else:
+                leaf = _session_leaf_for_append(conn, session_id)
+                parent_id_resolved = leaf
+                branch_root = None
+                if leaf is not None:
+                    parent_row = conn.execute(
+                        "SELECT branch_root_id FROM messages WHERE id=?",
+                        (int(leaf),),
+                    ).fetchone()
+                    branch_root = parent_row["branch_root_id"] if parent_row else None
+            # A branch's root id lives on the session_branches pointer, not on
+            # the anchor message row (which predates the fork and still carries
+            # NULL).  Inherit it from the current pointer so branch appends
+            # carry the branch marker exactly like their sibling rows.
+            if branch_root is None:
+                pointer = conn.execute(
+                    """SELECT branch_root_id FROM session_branches
+                       WHERE session_id=? ORDER BY created_at DESC, branch_id DESC LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+                if pointer is not None and pointer["branch_root_id"] is not None:
+                    branch_root = pointer["branch_root_id"]
+            cursor = conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, token_count, created_at, tool_call_id, parent_message_id, branch_root_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (session_id, role, content, json.dumps(tool_calls or []), token_count, time.time(), tool_call_id or None, parent_id_resolved, branch_root),
             )
+            # The current leaf pointer advances only when this message continues
+            # the session's active lineage (implicit append, or an explicit
+            # parent that is exactly the current leaf).  An explicit parent off
+            # the active lineage leaves the leaf pointer untouched so the
+            # active branch is not silently switched by a side insertion.
+            if cursor.lastrowid is not None:
+                current_leaf = _session_leaf_for_append(conn, session_id)
+                if parent is None or parent_id_resolved == current_leaf:
+                    _advance_session_leaf(conn, session_id, int(cursor.lastrowid))
             conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (time.time(), session_id))
         except sqlite3.IntegrityError:
             # 忽略外键约束错误
             pass
+
+
+def _session_leaf_for_append(conn: sqlite3.Connection, session_id: str) -> int | None:
+    """Resolve the current branch leaf for an implicit (no parent) append.
+
+    The latest ``session_branches`` row is the leaf pointer (it advances as
+    messages append).  When no branch/revert ever happened the log is linear
+    mainline, so the leaf falls back to the newest message.
+    """
+    row = conn.execute(
+        """SELECT message_id FROM session_branches
+           WHERE session_id=? ORDER BY created_at DESC, branch_id DESC LIMIT 1""",
+        (session_id,),
+    ).fetchone()
+    if row is not None and row["message_id"] is not None:
+        return int(row["message_id"]) or None
+    leaf = conn.execute(
+        "SELECT MAX(id) AS leaf FROM messages WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    return int(leaf["leaf"]) if leaf is not None and leaf["leaf"] is not None else None
+
+
+def _advance_session_leaf(conn: sqlite3.Connection, session_id: str, message_id: int) -> None:
+    """Move the latest branch pointer's leaf onto ``message_id`` (no new row)."""
+    conn.execute(
+        """UPDATE session_branches SET message_id=?
+           WHERE session_id=?
+             AND branch_id=(
+                 SELECT branch_id FROM session_branches
+                 WHERE session_id=? ORDER BY created_at DESC, branch_id DESC LIMIT 1
+             )""",
+        (int(message_id), session_id, session_id),
+    )
+
+
+# ── Session tree: branch / revert / tree (Wave5 E3) ──────────────────────
+
+def _session_leaf_conn(conn: sqlite3.Connection, session_id: str) -> int:
+    """The current branch leaf for one session on an open connection."""
+    leaf = _session_leaf_for_append(conn, session_id)
+    return int(leaf) if leaf is not None else 0
+
+
+def current_session_leaf(session_id: str) -> int:
+    """Return the id of the current branch leaf message (0 when empty)."""
+    with _get_conn() as conn:
+        return _session_leaf_conn(conn, session_id)
+
+
+def _branch_walk(conn: sqlite3.Connection, message_id: int) -> list[int]:
+    """Ancestor id chain from a message to its branch root (or mainline head).
+
+    Walks ``parent_message_id`` upward so the active lineage is always exactly
+    the messages reachable from the current leaf — shared ancestors are
+    included, sibling/diverged messages are not.  Returned oldest first.
+    """
+    chain: list[int] = []
+    current = int(message_id)
+    seen: set[int] = set()
+    while current and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        row = conn.execute(
+            "SELECT parent_message_id FROM messages WHERE id=?", (current,),
+        ).fetchone()
+        parent = int(row["parent_message_id"]) if row is not None and row["parent_message_id"] is not None else 0
+        if not parent:
+            break
+        current = parent
+    return list(reversed(chain))
+
+
+def _session_ancestor_ids(conn: sqlite3.Connection, session_id: str, leaf: int) -> list[int]:
+    """Active-branch ancestor ids for one session (oldest first).
+
+    Once any branch/revert pointer exists, the active lineage is the parent
+    chain from the leaf.  A session that never branched is the linear mainline
+    (pre-v4 history has no parent links at all), so its whole log by id order
+    is returned.
+    """
+    if not leaf:
+        return []
+    anchor = conn.execute(
+        """SELECT message_id FROM session_branches
+           WHERE session_id=? ORDER BY created_at DESC, branch_id DESC LIMIT 1""",
+        (session_id,),
+    ).fetchone()
+    if anchor is not None:
+        return _branch_walk(conn, leaf)
+    return [
+        int(row["id"]) for row in conn.execute(
+            "SELECT id FROM messages WHERE session_id=? ORDER BY id ASC", (session_id,),
+        ).fetchall()
+    ]
+
+
+def _decode_message_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    d = dict(row)
+    try:
+        d["tool_calls"] = json.loads(d.get("tool_calls") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        d["tool_calls"] = []
+    d["parent_message_id"] = (
+        int(d["parent_message_id"]) if d.get("parent_message_id") is not None else None
+    )
+    d["branch_root_id"] = (
+        int(d["branch_root_id"]) if d.get("branch_root_id") is not None else None
+    )
+    return d
+
+
+def get_session_messages(session_id: str, limit: int = 200) -> list[dict]:
+    """Return the active-branch messages (chronological) for one session.
+
+    The active branch is the parent lineage from the current leaf (or the
+    linear mainline when the session never branched).  Each row carries its
+    tree fields (``parent_message_id`` / ``branch_root_id``), so the consumer
+    can rebuild model context from the branch exactly as it was left.
+    """
+    bounded = max(1, min(int(limit), 1_000))
+    with _get_conn() as conn:
+        leaf = _session_leaf_conn(conn, session_id)
+        ancestor_ids = _session_ancestor_ids(conn, session_id, leaf)[-bounded:]
+        if ancestor_ids:
+            placeholders = ", ".join("?" for _ in ancestor_ids)
+            rows = conn.execute(
+                f"SELECT * FROM messages WHERE session_id=? AND id IN ({placeholders}) "
+                "ORDER BY id ASC",
+                [session_id, *ancestor_ids],
+            ).fetchall()
+        else:
+            rows = []
+    return [_decode_message_row(r) for r in rows]
+
+
+def session_branch(session_id: str, message_id: int) -> dict[str, Any] | None:
+    """Fork a new branch from one message: new leaf pointer, history untouched.
+
+    The new leaf pointer names ``message_id`` as the branch point; future
+    implicit ``add_message`` calls append onto this branch.  No message row is
+    copied or rewritten, so the fork is O(1) and fully reversible.
+    Returns the new ``session_branches`` row, or None when the anchor does not
+    exist / belongs to another session.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, branch_root_id FROM messages WHERE id=? AND session_id=?",
+            (int(message_id), session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        branch_root = (
+            int(row["branch_root_id"]) if row["branch_root_id"] is not None
+            else (int(row["id"]) if _branch_candidate(conn, session_id, int(row["id"])) else None)
+        )
+        branch_id = f"br_{uuid.uuid4().hex}"
+        now = time.time()
+        conn.execute(
+            """INSERT INTO session_branches
+               (branch_id, session_id, message_id, branch_root_id, created_at)
+               VALUES (?,?,?,?,?)""",
+            (branch_id, session_id, int(message_id), branch_root, now),
+        )
+        conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id))
+    return get_session_branch(branch_id)
+
+
+def _branch_candidate(conn: sqlite3.Connection, session_id: str, message_id: int) -> bool:
+    """A message starts a NEW branch root only when no branch already anchors it.
+
+    Re-branching from a message that already roots a branch keeps that
+    branch's root so the divergence stays grouped under one id.
+    """
+    existing = conn.execute(
+        "SELECT 1 FROM session_branches WHERE session_id=? AND branch_root_id=? LIMIT 1",
+        (session_id, message_id),
+    ).fetchone()
+    return existing is None
+
+
+def session_revert(session_id: str, message_id: int) -> dict[str, Any] | None:
+    """Move the leaf pointer back to one message without deleting history.
+
+    A pure rewind: no message row is touched or removed.  New appends continue
+    from ``message_id``; every downstream message stays on disk and
+    ``session_tree`` still shows it.  The new pointer inherits the target
+    message's own lineage (``branch_root_id``), so reverting into a branch
+    keeps that branch's grouping.  Returns the new row, or None when the
+    target does not exist / belongs to another session.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, branch_root_id FROM messages WHERE id=? AND session_id=?",
+            (int(message_id), session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        branch_id = f"br_{uuid.uuid4().hex}"
+        now = time.time()
+        conn.execute(
+            """INSERT INTO session_branches
+               (branch_id, session_id, message_id, branch_root_id, created_at)
+               VALUES (?,?,?,?,?)""",
+            (branch_id, session_id, int(message_id), row["branch_root_id"], now),
+        )
+        conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (now, session_id))
+    return get_session_branch(branch_id)
+
+
+def get_session_branch(branch_id: str) -> dict[str, Any] | None:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM session_branches WHERE branch_id=?", (branch_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def session_tree(session_id: str, limit: int = 500) -> dict[str, Any]:
+    """Return the full session message tree as nested children + lineage info.
+
+    The structure keeps every message that belongs to the session (across all
+    branches — branch/revert never deletes history), so the frontend can draw
+    divergent paths and the compressor can rebuild context from a branch.
+    Every node carries ``parent_message_id`` / ``branch_root_id`` /
+    ``branch_name`` plus ``children`` (ids).  ``current_leaf`` names the
+    active branch leaf; ``branches`` lists the recorded branch/revert
+    pointers (latest first).
+    """
+    bounded = max(1, min(int(limit), 2_000))
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id=? ORDER BY id ASC LIMIT ?",
+            (session_id, bounded),
+        ).fetchall()
+        leaf = _session_leaf_conn(conn, session_id)
+        branch_rows = conn.execute(
+            """SELECT * FROM session_branches WHERE session_id=?
+               ORDER BY created_at DESC, branch_id DESC LIMIT 200""",
+            (session_id,),
+        ).fetchall()
+    children: dict[int, list[int]] = {}
+    parents: dict[int, int | None] = {}
+    nodes: dict[int, dict[str, Any]] = {}
+    for r in rows:
+        mid = int(r["id"])
+        parent = int(r["parent_message_id"]) if r["parent_message_id"] is not None else None
+        parents[mid] = parent
+        d = _decode_message_row(r)
+        d["children"] = children.setdefault(mid, [])
+        d["branch_name"] = _branch_display_name(r["branch_root_id"])
+        nodes[mid] = d
+    for mid, parent in parents.items():
+        if parent is not None and parent in nodes:
+            children.setdefault(parent, []).append(mid)
+    roots = [mid for mid, parent in parents.items() if parent is None or parent not in nodes]
+    branches = [
+        {
+            "branch_id": str(b["branch_id"]),
+            "message_id": int(b["message_id"] or 0) or None,
+            "branch_root_id": b["branch_root_id"],
+            "branch_name": _branch_display_name(b["branch_root_id"]),
+            "created_at": float(b["created_at"] or 0),
+        }
+        for b in branch_rows
+    ]
+    return {
+        "session_id": session_id,
+        "current_leaf": leaf or None,
+        "branches": branches,
+        "roots": roots,
+        "nodes": nodes,
+        "message_count": len(nodes),
+    }
+
+
+def _branch_display_name(branch_root_id: Any) -> str:
+    return "主线" if branch_root_id is None else f"分支@{branch_root_id}"
 
 
 def _estimate_message_tokens(role: str, content: str, tool_calls: list) -> int:
@@ -2148,26 +3155,29 @@ def get_latest_assistant_message(session_id: str) -> str:
 def get_context_compaction_boundary(
     session_id: str, tail_count: int,
 ) -> dict[str, int]:
-    """Return one ID-ordered boundary and count from the durable message log."""
+    """Return one ID-ordered boundary and count from the active-branch log.
+
+    Wave5 E3: after a branch/revert the active lineage (``get_session_messages``)
+    is the context the next compaction gates, so the boundary and cutoff are
+    computed against that lineage instead of the whole session log.  A linear
+    session behaves exactly as before.
+    """
     tail = max(1, int(tail_count))
+    lineage = get_session_messages(session_id, limit=10_000)
     with _get_conn() as conn:
-        row = conn.execute(
-            """SELECT COUNT(*) AS total,
-                      COALESCE((
-                          SELECT id FROM messages
-                          WHERE session_id=?
-                          ORDER BY id DESC LIMIT 1 OFFSET ?
-                      ), 0) AS cutoff_message_id
-               FROM messages WHERE session_id=?""",
-            (session_id, tail, session_id),
-        ).fetchone()
         system_rows = conn.execute(
             """SELECT id, content FROM messages
                WHERE session_id=? AND role='system' ORDER BY id ASC""",
             (session_id,),
         ).fetchall()
-    total = int(row["total"] if row is not None else 0)
-    cutoff = int(row["cutoff_message_id"] if row is not None else 0)
+    total = len(lineage)
+    cutoff = 0
+    if total > tail:
+        # The cutoff is the last message OUTSIDE the retained tail (the
+        # ``tail``-th newest message), matching the durable ``cutoff_message_id``
+        # semantic: the retained context is every active-branch message with
+        # id strictly greater than the cutoff.
+        cutoff = int(lineage[-tail - 1]["id"])
     from modus.agent.compressor import SUMMARY_PREFIX
 
     contract_id = next(
@@ -2186,7 +3196,11 @@ def get_context_compaction_boundary(
 def get_messages_after_context_compaction(
     session_id: str, cutoff_message_id: int,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """Return the original system contract and every message after an ID boundary.
+    """Return the original system contract and every active-branch message after an ID boundary.
+
+    Wave5 E3: the retained rows are the active-branch lineage after the cutoff
+    (a branch/revert never deletes history, so this is what a branch-aware
+    restore replays).  A linear session behaves exactly as before.
 
     There is intentionally no silent limit: these rows were the active model
     context immediately before restart. The normal compression gate will bound
@@ -2195,6 +3209,11 @@ def get_messages_after_context_compaction(
     from modus.agent.compressor import SUMMARY_PREFIX
 
     cutoff = max(0, int(cutoff_message_id))
+    lineage = get_session_messages(session_id, limit=10_000)
+    rows = [
+        message for message in lineage
+        if int(message.get("id") or 0) > cutoff
+    ]
     with _get_conn() as conn:
         system_rows = conn.execute(
             """SELECT * FROM messages
@@ -2208,13 +3227,8 @@ def get_messages_after_context_compaction(
             ),
             None,
         )
-        rows = conn.execute(
-            """SELECT * FROM messages WHERE session_id=? AND id>?
-               ORDER BY id ASC""",
-            (session_id, cutoff),
-        ).fetchall()
 
-    def decode(row: sqlite3.Row) -> dict[str, Any]:
+    def decode(row: dict[str, Any]) -> dict[str, Any]:
         message = dict(row)
         try:
             message["tool_calls"] = json.loads(message.get("tool_calls") or "[]")
@@ -2224,8 +3238,8 @@ def get_messages_after_context_compaction(
 
     head_id = int(head["id"]) if head is not None else 0
     return (
-        decode(head) if head is not None else None,
-        [decode(row) for row in rows if int(row["id"]) != head_id],
+        decode(dict(head)) if head is not None else None,
+        [decode(row) for row in rows if int(row.get("id") or 0) != head_id],
     )
 
 
@@ -2288,7 +3302,9 @@ def restore_session(session_id: str, *, owner_id: str = "") -> dict | None:
     cutoff_message_id = (
         compaction.get("cutoff_message_id") if isinstance(compaction, dict) else None
     )
-    sess["messages"] = get_messages(session_id)
+    # The active-branch lineage (mainline by default; the current branch after
+    # a branch/revert) is what restore replays into model context.
+    sess["messages"] = get_session_messages(session_id)
     if cutoff_message_id is not None:
         try:
             cutoff = int(cutoff_message_id)

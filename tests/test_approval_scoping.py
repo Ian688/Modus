@@ -11,7 +11,7 @@ import pytest
 from modus.config import ModusConfig
 from modus.policy.approval import ApprovalDecision, ApprovalPolicy, SessionGrantStore
 from modus.tools.base import ApprovalResponse, Tool, ToolContext, ToolResult, object_schema
-from modus.tools.executor import ToolExecutor, _default_resource_key
+from modus.tools.executor import ToolExecutor, _default_resource_key, _effective_resource_key
 from modus.tools.registry import ToolRegistry
 
 
@@ -321,3 +321,86 @@ async def test_executor_modify_remember_records_modified_resource():
     # Remembered under the MODIFIED resource, not the original.
     assert store.lookup("bash", "cat b") is not None
     assert store.lookup("bash", "cat a") is None
+
+
+# ── permission_hint 接线（A1：builtins 声明处携带 resource key）──
+
+
+def test_builtin_bash_carries_command_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tool = {t.name: t for t in get_builtin_tools()}["bash"]
+    assert tool.permission_hint is not None
+    # Approving `cat a` scopes to the rewritten command, never `rm -rf /`.
+    assert tool.resource_key({"command": "cat a"}) == "cat a"
+    assert tool.resource_key({"command": "rm -rf /"}) == "rm -rf /"
+
+
+def test_builtin_run_tests_carries_command_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tool = {t.name: t for t in get_builtin_tools()}["run_tests"]
+    assert tool.resource_key({"command": "pytest -q tests/test_x.py"}) == "pytest -q tests/test_x.py"
+
+
+def test_builtin_web_fetch_carries_origin_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tool = {t.name: t for t in get_builtin_tools()}["web_fetch"]
+    # origin, not path: approving one host never reuses for an intranet address.
+    assert tool.resource_key({"url": "https://example.com/path?q=1"}) == "example.com"
+    assert tool.resource_key({"url": "http://10.0.0.1/admin"}) == "10.0.0.1"
+
+
+def test_builtin_git_fetch_carries_remote_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tools = {t.name: t for t in get_builtin_tools()}
+    assert tools["git_fetch"].resource_key({"remote": "origin"}) == "origin"
+    assert tools["git_fetch"].resource_key({"remote": "upstream"}) == "upstream"
+    # git_pull/git_push are remote-scoped too.
+    assert tools["git_pull"].resource_key({"remote": "origin", "branch": "main"}) == "origin"
+
+
+def test_builtin_path_tools_carry_target_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tools = {t.name: t for t in get_builtin_tools()}
+    assert tools["write_file"].resource_key({"path": "src/app.py", "content": "x"}) == "src/app.py"
+    assert tools["edit_file"].resource_key({"path": "src/app.py"}) == "src/app.py"
+    assert tools["office_exec"].resource_key({"path": "data/sales.xlsx", "script": "print(1)"}) == "data/sales.xlsx"
+
+
+def test_builtin_browser_navigate_carries_origin_permission_hint():
+    from modus.tools.builtins import get_builtin_tools
+
+    tool = {t.name: t for t in get_builtin_tools()}["browser_navigate"]
+    assert tool.resource_key({"url": "http://localhost:5173/"}) == "localhost:5173"
+
+
+def test_builtin_unscooped_tool_has_no_resource_key():
+    from modus.tools.builtins import get_builtin_tools
+
+    tool = {t.name: t for t in get_builtin_tools()}["list_dir"]
+    assert tool.permission_hint is None
+    assert tool.resource_key({"path": "src"}) is None
+
+
+def test_builtin_hints_drive_executor_resource_key():
+    """The declared hint feeds the executor's effective resource key."""
+    from modus.policy.approval import ApprovalDecision, ApprovalPolicy
+    from modus.tools.builtins import get_builtin_tools
+    from modus.tools.executor import _effective_resource_key
+
+    bash = {t.name: t for t in get_builtin_tools()}["bash"]
+    assert _effective_resource_key(bash, {"command": "cat a"}) == "cat a"
+    assert _effective_resource_key(bash, {"command": "rm -rf /"}) == "rm -rf /"
+    fetch = {t.name: t for t in get_builtin_tools()}["web_fetch"]
+    assert _effective_resource_key(fetch, {"url": "https://a.io/x"}) == "a.io"
+
+    # Policy: remember `cat a` → reuses exactly that command; `rm -rf /` still ASK.
+    policy = ApprovalPolicy(ModusConfig().policy)
+    store = SessionGrantStore()
+    store.record_grant("bash", "cat a", "approve")
+    assert policy.scoped_decision(bash, "cat a", store) is ApprovalDecision.ALLOW
+    assert policy.scoped_decision(bash, "rm -rf /", store) is ApprovalDecision.ASK

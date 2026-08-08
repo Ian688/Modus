@@ -13,6 +13,15 @@ from typing import Any
 from modus.agent.query import (
     _finalize_tool_calls, _merge_tool_delta, _tool_input, _tool_input_by_id, _tool_name_by_id,
 )
+from modus.agent.goal import (
+    build_budget_limited_summary_prompt,
+    build_goal_steering,
+    default_goal_store,
+    make_goal_tool,
+)
+from modus.agent.stall import (
+    LEVEL_LOOP, LEVEL_STALL, Ledger, build_stall_context_block,
+)
 from modus.config import ModusConfig
 from modus.llm.base import LlmClient
 from modus.runtime.cancellation import RunCancelled, await_or_cancel
@@ -39,6 +48,9 @@ class ReActReasoner:
         budget: RunBudget | None = None,
         session_id: str | None = None,
         run_id: str | None = None,
+        goal_store: Any = None,
+        goal_turns_budget: int | None = None,
+        goal_tokens_budget: int | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -54,6 +66,41 @@ class ReActReasoner:
         ))
         self.session_id = session_id
         self.run_id = run_id
+        # Goal-driven continuation (Wave4 G1).  ``goal_store`` is injected by
+        # the caller (defaults to the process-wide store); when a goal is
+        # active the loop re-injects steering on idle turns and soft-stops on
+        # budget limits instead of hard-stopping.  Explicit per-goal budgets
+        # let the caller cap a continuation round independently of the run's
+        # own limits; ``None`` means "no per-goal cap" (the run budget still
+        # applies).
+        self.goal_store = goal_store
+        self.goal_turns_budget = goal_turns_budget
+        self.goal_tokens_budget = goal_tokens_budget
+        self._goal_steered_this_run = False
+        # A pending soft-limit summary turn: when the goal crosses its per-goal
+        # budget, the loop injects a summarization prompt and lets the model
+        # produce a handoff turn before ending with the soft reason.
+        self._goal_summary_pending = False
+        self._goal_summary_reason: StopReason | None = None
+        # Deterministic stall detection (Wave4 G2): a ledger of tool outcomes
+        # plus the circuit-breaker state.  Stall detection never hard-breaks —
+        # it injects a reference-only ``[STALL DETECTED]`` block and escalates
+        # to ``StopReason.STALLED`` only after a sustained ``loop``.  Per-run
+        # (fresh per ``run()`` call) so continuation rounds restart clean.
+        self._ledger: Ledger | None = None
+        self._stall_injected_this_turn = False
+        # Wave5 E3 steering (steer vs followUp).  ``steer_queue`` holds user
+        # turns that must be injected *during* the run — after the current
+        # turn's tool results are replayed back into the message list and
+        # before the next LLM call (the same injection window goal-steering and
+        # stall context use).  ``followup_queue`` holds turns that wait until
+        # the whole run finishes, so the runner can drain them after
+        # settlement.  Both queues are session-scoped so a message queued by
+        # the WS layer reaches the active (or next) reasoner for this session;
+        # a reasoner without a session id uses the process-wide default.
+        self.steer_queue = steer_queue_for(self.session_id)
+        self.followup_queue = followup_queue_for(self.session_id)
+        self._steer_consumed = 0
 
     def _maybe_compact_mid_run(self, messages: list[Message]) -> None:
         """Deterministically compact the in-loop message list when over budget.
@@ -112,6 +159,41 @@ class ReActReasoner:
         except Exception:
             return
 
+    def _drain_steer_queue(self, messages: list[Message]) -> None:
+        """Inject pending steering turns right before the next LLM call.
+
+        Wave5 E3: a steering message must take effect mid-run — after the
+        previous turn's tool results are replayed back into the context and
+        before the next provider call.  Each queued message is appended as a
+        plain user turn (reference/instruction semantics are decided by the
+        producer; steering implies "act on this now").  The queue drains FIFO
+        so ordering is preserved and no message is re-injected across turns.
+        """
+        if not self.steer_queue:
+            return
+        pending = [
+            message for message in self.steer_queue
+            if id(message) not in {id(existing) for existing in messages}
+        ]
+        for message in pending:
+            messages.append(message)
+        self._steer_consumed += len(pending)
+        del self.steer_queue[:]
+
+    def drain_followup(self, messages: list[Message]) -> list[Message]:
+        """Consume the followup queue after a run has fully finished.
+
+        The runner calls this once per follow-up message so a turn that arrives
+        mid-run lands in the NEXT run's initial context instead of being lost.
+        Returns the consumed messages.
+        """
+        if not self.followup_queue:
+            return []
+        consumed = list(self.followup_queue)
+        self.followup_queue.clear()
+        messages.extend(consumed)
+        return consumed
+
     def _inject_python_diagnostics(
         self, messages: list[Message], paths: list[str],
     ) -> None:
@@ -140,6 +222,213 @@ class ReActReasoner:
         except Exception:
             return
 
+    # ── goal-driven continuation (Wave4 G1) ───────────────────────────────
+
+    def _resolve_goal_store(self) -> Any:
+        store = self.goal_store
+        if store is None:
+            try:
+                store = default_goal_store()
+            except Exception:
+                store = None
+        return store
+
+    def _maybe_inject_goal_steering(self, messages: list[Message], cancel_event: asyncio.Event | None) -> None:
+        """Inject the ``<goal-steering>`` meta message on an idle turn.
+
+        Runs at the TOP of each loop iteration, before the next LLM call.
+        Conditions (CCB's idle hook, ported to a loop-entry check):
+        - there is an active (runnable) goal for this session, AND
+        - the goal is not already complete/blocked, AND
+        - the user is NOT interacting right now (no cancel_event pending, no
+          new user turn waiting in the queue).
+
+        The steering message carries objective + token/turn state + Completion
+        Audit as a plain reference-only user message — exactly like the
+        existing self-adapt / diagnostics hints: it informs the model, it never
+        becomes a new instruction channel.
+        """
+        store = self._resolve_goal_store()
+        if store is None:
+            return
+        # User input priority: once the user cancels or a new message is in
+        # flight, auto-continuation yields immediately.
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        # Inject at most once per run: a fresh continuation round re-injects the
+        # objective at its start, but re-injecting on every LLM turn would just
+        # bloat context with the same block.
+        if self._goal_steered_this_run:
+            return
+        try:
+            state = store.active(self.session_id)
+        except Exception:
+            return
+        if state is None:
+            return
+        # Only steer when the goal is actually continuing; a budget_limited
+        # goal gets the summary prompt (handled at the limit), not steering.
+        from modus.agent.goal import STATUS_BUDGET_LIMITED, STATUS_MAX_TURNS
+
+        if state.status in (STATUS_BUDGET_LIMITED, STATUS_MAX_TURNS):
+            return
+        # Avoid piling a second steering message before the model has consumed
+        # the one we already injected this iteration.
+        if messages and "<goal-steering>" in str(messages[-1].content):
+            return
+        try:
+            steering = build_goal_steering(
+                state,
+                turns_budget=self.goal_turns_budget,
+                tokens_budget=self.goal_tokens_budget,
+            )
+        except Exception:
+            return
+        messages.append(Message(role="user", content=steering))
+        self._goal_steered_this_run = True
+
+    def _check_goal_limits(self) -> StopReason | None:
+        """Return the soft-limit stop reason for this goal, if any.
+
+        ``None`` means the goal is still within its (optional) per-goal budget
+        and the loop keeps going.  Crossing a per-goal budget never hard-stops
+        a run the way ``BudgetExceeded`` does — the caller records the soft
+        state and continues once (the summarization prompt is injected and the
+        run ends with the soft reason).
+        """
+        store = self._resolve_goal_store()
+        if store is None:
+            return None
+        try:
+            state = store.get(self.session_id)
+        except Exception:
+            return None
+        if state is None or state.is_terminal():
+            return None
+        if self.goal_tokens_budget is not None and state.tokens_used >= self.goal_tokens_budget:
+            return StopReason.GOAL_BUDGET_LIMITED
+        if self.goal_turns_budget is not None and state.turns_executed >= self.goal_turns_budget:
+            return StopReason.GOAL_MAX_TURNS
+        return None
+
+    def _record_goal_turn(self, tokens: int, turn: int) -> None:
+        """Add one executed turn + tokens to the session goal accounting.
+
+        Called once per completed loop turn.  The goal's own per-goal budgets
+        are applied here so the soft ``GOAL_*`` states are reached without a
+        hard ``BudgetExceeded``.  Token accounting stays single-source: when a
+        per-goal token budget is set, ``update_tokens`` owns the counter;
+        otherwise ``record_turn`` records it without any transition.
+        """
+        store = self._resolve_goal_store()
+        if store is None:
+            return
+        try:
+            state = store.get(self.session_id)
+        except Exception:
+            return
+        if state is None or state.is_terminal():
+            return
+        try:
+            store.record_turn(
+                self.session_id,
+                count=1,
+                tokens=tokens if self.goal_tokens_budget is None else 0,
+                budget_total=self.goal_turns_budget,
+            )
+        except Exception:
+            return
+        if self.goal_tokens_budget is not None:
+            try:
+                store.update_tokens(
+                    self.session_id,
+                    {"input_tokens": tokens, "output_tokens": 0},
+                    total=self.goal_tokens_budget,
+                )
+            except Exception:
+                return
+
+    # ── deterministic stall detection (Wave4 G2) ──────────────────────────
+
+    def _maybe_inject_stall_context(
+        self,
+        messages: list[Message],
+        budget: Any,
+    ) -> bool:
+        """Check the circuit breaker and inject a ``[STALL DETECTED]`` block.
+
+        Returns True when a block was injected.  The injected message is
+        reference-only (exactly like goal-steering / self-adapt hints): it tells
+        the model what failing pattern it is repeating and suggests a course
+        change — it is NOT a new instruction channel and never hard-breaks the
+        loop.  A sustained ``loop`` (or a stall-token cap backstop) escalates
+        the run to ``StopReason.STALLED`` at the NEXT loop iteration.
+        """
+        ledger = self._ledger
+        if ledger is None:
+            return False
+        if self._stall_injected_this_turn:
+            return False
+        try:
+            result = ledger.check_circuit_breaker()
+        except Exception:
+            return False
+        if result.level not in (LEVEL_STALL, LEVEL_LOOP):
+            return False
+        try:
+            block = build_stall_context_block(
+                result.level,
+                action=result.action,
+                count=result.count,
+                signature=result.signature,
+                pattern=result.pattern or None,
+            )
+        except Exception:
+            return False
+        if not block:
+            return False
+        messages.append(Message(role="user", content=block))
+        self._stall_injected_this_turn = True
+        return True
+
+    def _stall_escalation_reason(
+        self,
+        budget: Any,
+        *,
+        loop_threshold: int,
+        no_progress_threshold: int,
+        verification_required: bool,
+    ) -> StopReason | None:
+        """Return ``STALLED`` when the run should hand off to a human, else None.
+
+        Escalation is conservative and deterministic:
+        - never while verification is required (the verification loop owns
+          recovery), and never when there are too few turns on record;
+        - a circuit breaker that stays at ``loop`` for ``loop_threshold``
+          consecutive checks;
+        - a stalled-pattern token cap backstop (``stall_tokens_exceeded``).
+        """
+        if verification_required:
+            return None
+        if not hasattr(budget, "turn_records") or len(budget.turn_records) < 2:
+            return None
+        ledger = self._ledger
+        if ledger is None:
+            return None
+        try:
+            if ledger.consecutive_loops >= loop_threshold:
+                return StopReason.STALLED
+        except Exception:
+            pass
+        if no_progress_threshold > 0 and budget.stalled_for(no_progress_threshold):
+            return StopReason.STALLED
+        try:
+            if hasattr(budget, "stall_tokens_exceeded") and budget.stall_tokens_exceeded():
+                return StopReason.STALLED
+        except Exception:
+            pass
+        return None
+
     async def run(
         self,
         messages: list[Message],
@@ -148,6 +437,13 @@ class ReActReasoner:
         cancel_event: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         budget = self.budget
+        # Goal steering fires at most once per run (each fresh continuation
+        # round re-injects the objective at its start).
+        self._goal_steered_this_run = False
+        # Deterministic stall detection is per-run: each run() call starts a
+        # fresh ledger and a fresh escalation counter.
+        self._ledger = Ledger()
+        self._stall_injected_this_turn = False
         # Make the run budget the active ContextVar for this loop so shared
         # primitives (await_or_cancel's wall-clock deadline, tool handlers that
         # consult active_run_budget) see the same accounting source.  Desktop
@@ -195,6 +491,25 @@ class ReActReasoner:
                     merged.register(tool)
             merged.register(extra)
             registry = merged
+        # Goal-driven continuation (Wave4 G1): expose the model-side ``goal``
+        # receipt tool so the agent can self-report status.  Declared safe +
+        # read-only + memory capability: it never touches files, never needs
+        # approval, and only reads/updates the session's own goal state.
+        try:
+            goal_store = self._resolve_goal_store()
+            if goal_store is not None:
+                goal_tool = make_goal_tool(store=goal_store)
+                merged_registry = ToolRegistry()
+                for _name in registry.list_names():
+                    _tool = registry.get(_name)
+                    if _tool is not None:
+                        merged_registry.register(_tool)
+                merged_registry.register(goal_tool)
+                registry = merged_registry
+        except Exception:
+            # A goal-tool wiring failure must never break the loop; the goal
+            # steering still works without the tool.
+            pass
         tool_definitions = registry.definitions()
         executor = ToolExecutor(
             registry,
@@ -223,6 +538,14 @@ class ReActReasoner:
             except BudgetExceeded as exc:
                 terminal_reason = exc.reason
                 break
+            # Goal-driven idle continuation (Wave4 G1): at the TOP of every loop
+            # iteration — before the next LLM call — check whether an active
+            # goal exists and the user is idle; if so, inject the
+            # ``<goal-steering>`` meta message (objective + token state +
+            # Completion Audit) so the model keeps attacking instead of treating
+            # the budget as a hard stop.  User input priority: a pending cancel
+            # or a queued user turn suppresses steering entirely.
+            self._maybe_inject_goal_steering(messages, cancel_event)
             # Self-aware stall detection: if the last N turns all made no
             # progress (no text, no thinking, no tool attempt), stop before
             # burning the remaining budget on an agent that is spinning.  A run
@@ -232,6 +555,9 @@ class ReActReasoner:
             verification_required = bool(
                 budget.verification.snapshot().get("required", False)
             )
+            # Allow one stall-context injection per loop iteration (a fresh turn
+            # may inject again if the pattern persists).
+            self._stall_injected_this_turn = False
             if (
                 stall_threshold > 0
                 and not verification_required
@@ -240,6 +566,36 @@ class ReActReasoner:
                 terminal_reason = StopReason.NO_PROGRESS
                 budget.finish(StopReason.NO_PROGRESS)
                 break
+            # Deterministic stall escalation (Wave4 G2): hand the run to a human
+            # with a written diagnostic when the circuit breaker has been at
+            # ``loop`` across consecutive turns (or the stall-token cap is hit).
+            # Conservative: never while verification owns recovery, never before
+            # a couple of turns are on record.  ``STALLED`` is an escalation of
+            # the soft hints, not a hard loop break.
+            loop_escalation_threshold = int(getattr(
+                getattr(self.config, "features", None),
+                "stall_loop_escalation_threshold", 2,
+            ) or 2)
+            stall_reason = self._stall_escalation_reason(
+                budget,
+                loop_threshold=max(1, loop_escalation_threshold),
+                no_progress_threshold=stall_threshold,
+                verification_required=verification_required,
+            )
+            if stall_reason is not None:
+                terminal_reason = stall_reason
+                budget.finish(stall_reason)
+                break
+            # Deterministic stall context (Wave4 G2): once the circuit breaker
+            # reports ``stall``/``loop``, inject a reference-only ``[STALL
+            # DETECTED]`` block so the model sees its repeated failing pattern
+            # and changes course.  This is an informative nudge — never a hard
+            # break and never a new instruction channel.
+            self._maybe_inject_stall_context(messages, budget)
+            # Wave5 E3 steering: consume pending steer turns right after the
+            # previous turn's tool results are back in the context and before
+            # the next LLM call — the same injection window goal/stall use.
+            self._drain_steer_queue(messages)
             # Self-adaptive loop: when enabled, read turn_records trends and
             # inject a bounded corrective hint (never loops, never changes
             # strategy mid-run — only nudges with a reference-only message).
@@ -343,11 +699,69 @@ class ReActReasoner:
                 continue
 
             budget.record_usage(usage_input, usage_output, owner="host:react")
+            # Deterministic stall tokens (Wave4 G2): once the circuit breaker is
+            # at ``loop``, this turn's tokens count toward the separate stall
+            # counter so a spinning agent is noticed without first burning the
+            # whole budget (the cap backstop escalates to ``STALLED``).  The
+            # authoritative total is untouched.
+            try:
+                if (
+                    self._ledger is not None
+                    and self._ledger.consecutive_loops > 0
+                ):
+                    budget.record_stall_tokens(
+                        usage_input + usage_output, owner="host:react-stall",
+                    )
+            except Exception:
+                pass
             try:
                 budget.check_limits()
             except BudgetExceeded as exc:
                 terminal_reason = exc.reason
                 break
+            # Goal accounting (Wave4 G1): add this turn + its tokens to the
+            # session goal so the goal's own budgets can be applied softly.
+            self._record_goal_turn(usage_input + usage_output, turn)
+            # Summary handoff turn (Wave4 G1): the goal hit its per-goal budget
+            # in a previous iteration and the model just wrote the handoff in
+            # THIS turn (the summary prompt forbids further tool execution).
+            # Take its text and end with the soft goal reason — the loop never
+            # re-injects the summary prompt on a later iteration.
+            if self._goal_summary_pending:
+                summary_reason = self._goal_summary_reason or StopReason.GOAL_BUDGET_LIMITED
+                messages.append(Message(role="assistant", content=text))
+                yield {"type": "turn_complete", "turn": turn, "stop_reason": "end_turn"}
+                terminal_reason = budget.finish(summary_reason)
+                break
+            # Goal-driven soft limit (Wave4 G1): crossing a *per-goal* budget is
+            # not a hard stop.  When the goal hit its token/turn budget, record
+            # the soft state and inject a summarization prompt; the loop then
+            # runs ONE handoff turn in which the model writes "已达成/还差/下一步"
+            # without executing further tools.  The goal survives to be resumed
+            # next round (``/goal continue``).
+            goal_limit = self._check_goal_limits()
+            if goal_limit is not None:
+                goal_store = self._resolve_goal_store()
+                try:
+                    state = goal_store.get(self.session_id)
+                except Exception:
+                    state = None
+                if state is not None and not state.is_terminal():
+                    if goal_limit is StopReason.GOAL_BUDGET_LIMITED:
+                        try:
+                            goal_store.mark_budget_limited(self.session_id)
+                        except Exception:
+                            pass
+                    elif goal_limit is StopReason.GOAL_MAX_TURNS:
+                        try:
+                            goal_store.mark_max_turns(self.session_id)
+                        except Exception:
+                            pass
+                    summary = build_budget_limited_summary_prompt(state)
+                    messages.append(Message(role="user", content=summary))
+                    self._goal_summary_pending = True
+                    self._goal_summary_reason = goal_limit
+                    continue
             tool_calls = _finalize_tool_calls(tool_states)
 
             assistant_message = Message(role="assistant", content=text, tool_calls=tool_calls)
@@ -375,10 +789,35 @@ class ReActReasoner:
                 budget.verification.observe_tool(
                     name=tool_name, payload=tool_payload, result=model_text, is_error=result.is_error,
                 )
+                # Wave-3 A3: record this (objective, operation, capability) into
+                # the coverage matrix so the board can show what's been tried vs
+                # what's left.  Best-effort; a coverage failure never breaks the
+                # loop.
+                try:
+                    from modus.tools.coverage import mark_coverage_call
+
+                    mark_coverage_call(
+                        context.session_id, tool_name, tool_payload, result.is_error,
+                    )
+                except Exception:
+                    pass
                 if result.is_error:
                     tool_errors += 1
                 else:
                     tool_successes += 1
+                # Deterministic stall ledger (Wave4 G2): append this tool outcome
+                # so the circuit breaker can spot a repeated failing signature.
+                # Best-effort; a ledger failure never breaks the loop.
+                try:
+                    if self._ledger is not None:
+                        self._ledger.add(
+                            action=tool_name,
+                            outcome="error" if result.is_error else "success",
+                            error_text=model_text if result.is_error else "",
+                            tokens=0,
+                        )
+                except Exception:
+                    pass
                 event = {
                     "type": "tool_result", "tool_call_id": str(result.tool_use_id or ""),
                     "name": tool_name,
@@ -494,3 +933,70 @@ def _grant_store(session_id: str | None) -> Any:
             store = SessionGrantStore()
             _GRANT_STORES[key] = store
         return store
+
+
+# Wave5 E3: session-scoped steer / followUp queues.  The WS layer appends a
+# user turn tagged ``steer:true`` to the steering queue and any other
+# mid-run/end-of-run turn to the follow-up queue.  Every ReActReasoner for a
+# session reads the SAME queues, so a steer queued while the run is live is
+# consumed by the active reasoner before its next LLM call, and a followUp
+# queued mid-run is drained into the next run's initial context.
+_STEER_QUEUES: dict[str, list[Message]] = {}
+_FOLLOWUP_QUEUES: dict[str, list[Message]] = {}
+_QUEUE_LOCK: Any = None
+
+
+def _queue_key(session_id: str | None) -> str:
+    return str(session_id or "default")
+
+
+def steer_queue_for(session_id: str | None) -> list[Message]:
+    """Return the session-scoped steering queue (creating it lazily)."""
+    global _QUEUE_LOCK
+    if _QUEUE_LOCK is None:
+        import threading
+
+        _QUEUE_LOCK = threading.Lock()
+    key = _queue_key(session_id)
+    with _QUEUE_LOCK:
+        queue = _STEER_QUEUES.get(key)
+        if queue is None:
+            queue = []
+            _STEER_QUEUES[key] = queue
+        return queue
+
+
+def followup_queue_for(session_id: str | None) -> list[Message]:
+    """Return the session-scoped follow-up queue (creating it lazily)."""
+    global _QUEUE_LOCK
+    if _QUEUE_LOCK is None:
+        import threading
+
+        _QUEUE_LOCK = threading.Lock()
+    key = _queue_key(session_id)
+    with _QUEUE_LOCK:
+        queue = _FOLLOWUP_QUEUES.get(key)
+        if queue is None:
+            queue = []
+            _FOLLOWUP_QUEUES[key] = queue
+        return queue
+
+
+def enqueue_steer(session_id: str | None, message: Message) -> None:
+    """Append one user turn to a session's steering queue (thread-safe)."""
+    steer_queue_for(session_id).append(message)
+
+
+def enqueue_followup(session_id: str | None, message: Message) -> None:
+    """Append one user turn to a session's follow-up queue (thread-safe)."""
+    followup_queue_for(session_id).append(message)
+
+
+def drain_followup_for(session_id: str | None) -> list[Message]:
+    """Consume and return a session's pending follow-up turns."""
+    queue = followup_queue_for(session_id)
+    if not queue:
+        return []
+    consumed = list(queue)
+    queue.clear()
+    return consumed

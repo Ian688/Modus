@@ -26,6 +26,16 @@ Security model (mirrors the bash/spawn_process posture):
 - **Result binding**: the script may print JSON (or text); the model receives
   the bounded output.  Writes are persisted by the script itself via openpyxl/
   docx/pptx save to ABS_PATH.
+
+Worker mode (Wave0 W0-2): passing ``worker: true`` runs the script through the
+``WorkerPool`` as an isolated, memory-capped worker process so several heavy
+Office jobs can run in parallel without starving the main process.  The worker
+layer is configured by ``runtime.worker`` and **defaults to off**
+(``worker.enabled = False`` in ``modus/config.py``) — when disabled,
+``worker: true`` transparently falls back to the synchronous direct path, so the
+tool stays usable in every configuration.  Enabling the worker layer does not
+relax any safety boundary here (AST scan, PathGuard target, approval gate, and
+process-group isolation all still apply).
 """
 
 from __future__ import annotations

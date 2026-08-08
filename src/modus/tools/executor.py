@@ -175,13 +175,116 @@ class ToolExecutor:
                 self._record_remember(
                     tool, effective_payload, decision, context, tool_call_id,
                 )
-            return result
+            # C3 uniform exit: a tool that handled its oversized result itself
+            # (grep/search_code via persist_oversized, bash/run_tests via
+            # bounded model_payload) is left untouched; every other result with
+            # content over the threshold is bridged to a compact handle here.
+            if not tool.is_read_only:
+                self._invalidate_result_cache(tool.name, effective_payload)
+            return self._bridge_fallback(result, tool, effective_payload)
         except Exception as exc:
             return ToolResult(
                 tool_use_id=tool_call_id,
                 content=f'Tool "{name}" execution error: {exc}',
                 is_error=True,
             )
+
+    def _invalidate_result_cache(
+        self, tool_name: str, payload: dict[str, Any],
+    ) -> None:
+        """Best-effort invalidation of the result cache after a mutation.
+
+        A known write tool (``_MUTATING_TOOLS``) can change what any later read
+        sees, so the whole content-addressed cache is cleared — the next
+        identical read re-executes instead of serving a stale handle.  Other
+        mutating tools (bash/run_tests/...) invalidate only their own cached
+        reads by arg overlap.  Best-effort: a failure here never affects the
+        executed tool, and only non-read-only invocations reach this path.
+        """
+        try:
+            from modus.desktop.artifacts import _MUTATING_TOOLS, invalidate_cache
+        except Exception:
+            return
+        try:
+            if tool_name in _MUTATING_TOOLS:
+                # A known write tool can change what any later read sees:
+                # clear the whole content-addressed cache.
+                invalidate_cache("", None)
+            else:
+                invalidate_cache(tool_name, payload)
+        except Exception:
+            return
+
+    def _bridge_fallback(
+        self,
+        result: ToolResult,
+        tool: Tool,
+        payload: dict[str, Any],
+    ) -> ToolResult:
+        """Executor-level oversized-result bridge (C3 fallback).
+
+        Priority is tool-internal handling: any result that already carries a
+        ``model_payload`` (grep/search_code handles, bash/run_tests bounded
+        payloads) or an error passes through unchanged.  A2 deny/skip
+        structured results are small, non-error *information* — their metadata
+        marks them as approval outcomes, and they are never mistaken for a
+        large result.  Everything else whose visible content exceeds the
+        threshold is persisted to the private artifact store and the model
+        receives a compact ``{path, sha256, size, preview}`` handle.
+        """
+        if result.model_payload is not None:
+            return result
+        if result.is_error:
+            return result
+        meta = result.metadata or {}
+        if meta.get("operation") in ("approval-denied", "skipped"):
+            return result
+        content = result.content or ""
+        try:
+            from modus.desktop.artifacts import (
+                DEFAULT_PERSIST_THRESHOLD_BYTES,
+                persist_oversized,
+            )
+        except Exception:
+            return result
+        if len(content.encode("utf-8")) <= DEFAULT_PERSIST_THRESHOLD_BYTES:
+            return result
+        try:
+            handle = persist_oversized(
+                tool.name, content, suffix="txt", args=payload, cache=False,
+            )
+        except Exception:
+            # A persistence failure never turns a completed tool into an error.
+            return result
+        if handle is None:
+            return result
+        payload_text = (
+            f"[{tool.name}: 结果过大，完整内容已落盘]\n"
+            f"path: {handle['path']}\n"
+            f"sha256: {handle['sha256']}\n"
+            f"size: {handle['size']} bytes\n"
+            f"[另有 {handle['lines_total']} 行 {handle['chars_total']} 字符已落盘]\n"
+            f"[预览（前/后各 6 行）]\n{handle['preview']}"
+        )
+        return ToolResult(
+            payload_text,
+            is_error=result.is_error,
+            tool_use_id=result.tool_use_id,
+            display_summary=result.display_summary,
+            raw_result=content,
+            model_payload=payload_text,
+            artifacts=result.artifacts + [
+                {key: handle[key] for key in ("path", "sha256", "size", "preview")},
+            ],
+            disclosure=dict(result.disclosure) | {
+                "local_bytes_read": len(content),
+                "model_bytes_sent": len(payload_text),
+                "raw_content_sent": False,
+                "oversized": True,
+            },
+            logs=list(result.logs),
+            metadata=dict(meta) | {"persisted": True, "size": handle["size"]},
+        )
 
     def _record_remember(
         self,

@@ -108,12 +108,18 @@ def _run_ref(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def aggregate_board(runs: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_board(
+    runs: list[dict[str, Any]],
+    *,
+    coverage_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Aggregate semantic runs into one board-level DTO.
 
     Pure and deterministic: the input is exactly the Workbench run list (each
-    with its ``semantic`` projection).  Output is keyed for the frontend
-    board columns plus a summary strip; every field has a safe default.
+    with its ``semantic`` projection) plus an optional ``coverage_summary``
+    (a ``CoverageStore.summary()`` dict read by the server).  Output is keyed
+    for the frontend board columns plus a summary strip; every field has a safe
+    default.
     """
     runs = [run for run in runs if isinstance(run, dict)]
     counts = _column_counts(runs)
@@ -179,6 +185,41 @@ def aggregate_board(runs: list[dict[str, Any]]) -> dict[str, Any]:
         },
         "modes": dict(sorted(modes.items())),
         "worker_count": worker_count,
+        # Work-completion dimension (Wave3 A3): "what's left" is a first-class
+        # board number.  ``untested_count`` drives the kanban 未覆盖 badge.
+        "coverage": _coverage_section(coverage_summary),
+    }
+
+
+def _coverage_section(summary: dict[str, Any] | None) -> dict[str, Any]:
+    """Map a ``CoverageStore.summary()`` into a board-safe coverage section.
+
+    Pure: the coverage ledger is read by the server (from the session store)
+    and passed here; this function only derives the counts the kanban header
+    badge (``data-kb-attention``) reuses.  Total and deterministic: a missing
+    or malformed summary contributes an empty section, never an exception.
+    """
+    empty = {
+        "schema": "modus.board-coverage.v1",
+        "total": 0,
+        "untested_count": 0,
+        "by_state": {"tried": 0, "passed": 0, "failed": 0, "skipped": 0},
+        "coverage_rate": 0.0,
+    }
+    if not summary or not isinstance(summary, dict):
+        return empty
+    by_state = summary.get("by_state") or {}
+    if not isinstance(by_state, dict):
+        by_state = {}
+    return {
+        "schema": "modus.board-coverage.v1",
+        "total": _integer(summary.get("total")),
+        "untested_count": _integer(summary.get("untested_count")),
+        "by_state": {
+            state: _integer(by_state.get(state))
+            for state in ("tried", "passed", "failed", "skipped")
+        },
+        "coverage_rate": float(summary.get("coverage_rate") or 0.0),
     }
 
 

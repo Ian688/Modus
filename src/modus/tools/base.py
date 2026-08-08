@@ -120,10 +120,15 @@ class ToolResult:
     # bounded ``model_payload`` (with the full text persisted as an artifact).
     raw_result: Any = None
     # What the current model sees for this tool result.  ``None`` keeps
-    # backward compatibility: consumers fall back to ``content``.
+    # backward compatibility: consumers fall back to ``content``.  C3
+    # (result bridge) sets this to a compact handle ``{path, sha256, size,
+    # preview}`` and keeps the raw text in ``raw_result`` — the existing
+    # fields already carry the bridge without any schema change.
     model_payload: str | None = None
     # Local artifacts that hold the full result (persisted under Modus's
-    # private data directory).  Exposed to the UI by id only.
+    # private data directory).  Exposed to the UI by id only.  The C3 bridge
+    # appends its handle dict here so the frontend can link the row to the
+    # persisted file.
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     # Diagnostic details, not part of the model payload or the visible result.
     logs: list[str] = field(default_factory=list)

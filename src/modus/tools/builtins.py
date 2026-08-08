@@ -12,6 +12,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from modus.policy import CommandGuard, PathGuard
 from modus.policy.path_guard import PathPolicyError
@@ -37,6 +38,7 @@ from modus.tools.office import (
     word_extract,
 )
 from modus.tools.office_exec import office_exec
+from modus.tools.coverage import coverage
 from modus.tools.payload import bounded_for_model
 from modus.tools.system_control import (
     port_list,
@@ -46,6 +48,7 @@ from modus.tools.system_control import (
 from modus.tools.process_tools import (
     kill_process,
     list_processes,
+    restart_process,
     spawn_process,
     tail_process,
 )
@@ -53,6 +56,13 @@ from modus.tools.system_probe import system_probe
 
 from modus.web.search import search_web
 from modus.web.fetch import fetch_url
+
+from modus.desktop.artifacts import (
+    cache_key,
+    cached_handle,
+    invalidate_cache,
+    persist_oversized,
+)
 
 
 async def list_dir(payload: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -310,6 +320,12 @@ async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
         except re.error as exc:
             return ToolResult(f"invalid regex: {exc}", is_error=True)
 
+        # C3 result bridge: reuse an intact content-addressed handle for an
+        # identical read before re-scanning the workspace.
+        cached = _cached_handle_result("grep", context, payload)
+        if cached is not None:
+            return cached
+
         matches: list[str] = []
         truncated = {"hit": False}
 
@@ -332,13 +348,21 @@ async def grep(payload: dict[str, Any], context: ToolContext) -> ToolResult:
                 if found:
                     matches.append(f"{_display_path(file_path, root)}:{line_number}: {line.strip()}")
                     if len(matches) >= limit:
-                        return ToolResult("\n".join(matches))
+                        text = "\n".join(matches)
+                        bridged = _bridge_oversized("grep", text, context, payload)
+                        if bridged is not None:
+                            return bridged
+                        return ToolResult(text)
         if truncated["hit"]:
             cap = _scan_cap(context)
             footer = f"\n... [扫描达上限 {cap} 文件，结果不完整]"
         else:
             footer = ""
-        return ToolResult("\n".join(matches) + footer if matches else (f"(no matches){footer}"))
+        text = "\n".join(matches) + footer if matches else (f"(no matches){footer}")
+        bridged = _bridge_oversized("grep", text, context, payload)
+        if bridged is not None:
+            return bridged
+        return ToolResult(text)
     except PathPolicyError as exc:
         return _path_error(exc)
 
@@ -376,13 +400,19 @@ async def search_memory(payload: dict[str, Any], context: ToolContext) -> ToolRe
             "Memory retrieval requires a persisted Desktop session.", is_error=True,
         )
     try:
-        from modus.desktop.memory import search_memories
+        from modus.desktop.memory import (
+            authority_of_memory, search_memories,
+        )
         results = search_memories(context.session_id, query, limit=6)
     except Exception as exc:
         return ToolResult(f"search_memory failed: {exc}", is_error=True)
     if not results:
         return ToolResult("No matching memories found.")
-    lines = [f"[{m['category']}] {m['content']}" for m in results]
+    lines = []
+    for m in results:
+        authority = authority_of_memory(m)
+        suffix = "（auto-extracted 未经验证）" if authority == "auto" else ""
+        lines.append(f"[{m['category']}]{suffix} {m['content']}")
     return ToolResult("\n".join(lines))
 
 
@@ -521,6 +551,140 @@ def _display_path(path: Path, base: Path) -> str:
     except ValueError:
         return str(path)
 
+
+def _cached_handle_result(
+    name: str, context: ToolContext, args: dict[str, Any],
+) -> ToolResult | None:
+    """Return a compact handle result when an intact cached read exists.
+
+    The result cache is content-addressed by ``(tool, args)``.  An intact
+    entry (verified by SHA-256 against the persisted file) means an identical
+    read already ran — reuse its handle instead of re-scanning the workspace.
+    """
+    try:
+        handle = cached_handle(name, args)
+    except Exception:
+        return None
+    if handle is None:
+        return None
+    payload = (
+        f"[{name}: 结果过大，完整内容已落盘（缓存复用）]\n"
+        f"path: {handle['path']}\n"
+        f"sha256: {handle['sha256']}\n"
+        f"size: {handle['size']} bytes\n"
+        f"[另有 {handle['lines_total']} 行 {handle['chars_total']} 字符已落盘]\n"
+        f"[预览（前/后各 6 行）]\n{handle['preview']}"
+    )
+    return ToolResult(
+        payload,
+        model_payload=payload,
+        raw_result=None,
+        artifacts=[{key: handle[key] for key in ("path", "sha256", "size", "preview")}],
+        disclosure={
+            "model_bytes_sent": len(payload),
+            "raw_content_sent": False,
+            "oversized": True,
+            "cached": True,
+        },
+        metadata={"operation": name, "persisted": True, "cached": True, "size": handle["size"]},
+    )
+
+
+def _bridge_oversized(
+    name: str,
+    content: str,
+    context: ToolContext,
+    args: dict[str, Any],
+) -> ToolResult | None:
+    """Persist an oversized read result and return a compact handle result.
+
+    Runs the C3 result bridge for grep/search_code: content larger than the
+    100KB threshold is written to Modus's private ``artifacts/result-cache``
+    directory and the model receives ``{path, sha256, size, preview}`` instead
+    of the full text.  The handle is content-addressed by ``(tool, args)`` so
+    an identical read is reused without re-scanning, and it is recorded as an
+    artifact so the frontend can link the row to the persisted file.
+
+    Returns ``None`` when the content is small enough to keep inline, so the
+    caller preserves today's exact result shape for normal results.
+    """
+    try:
+        handle = persist_oversized(
+            name, content, suffix="txt", args=args, cache=True,
+        )
+    except Exception:
+        # A persistence failure must never turn a completed search into an
+        # error; fall back to the existing inline result.
+        return None
+    if handle is None:
+        return None
+    payload = (
+        f"[{name}: 结果过大，完整内容已落盘]\n"
+        f"path: {handle['path']}\n"
+        f"sha256: {handle['sha256']}\n"
+        f"size: {handle['size']} bytes\n"
+        f"[另有 {handle['lines_total']} 行 {handle['chars_total']} 字符已落盘]\n"
+        f"[预览（前/后各 6 行）]\n{handle['preview']}"
+    )
+    return ToolResult(
+        payload,
+        model_payload=payload,
+        raw_result=content,
+        artifacts=[{key: handle[key] for key in ("path", "sha256", "size", "preview")}],
+        disclosure={
+            "local_bytes_read": len(content),
+            "model_bytes_sent": len(payload),
+            "raw_content_sent": False,
+            "oversized": True,
+        },
+        metadata={"operation": name, "persisted": True, "size": handle["size"]},
+    )
+
+# ── A1 permission hints ──────────────────────────────────────────────────────
+#
+# Each ``Tool`` declares a ``permission_hint`` callable that derives the
+# approval resource key from a validated payload.  The executor computes the
+# effective key via ``tool.resource_key(payload)`` (A1 scoped approval).  These
+# are the same resource classifications the executor's metadata fallback
+# already applies; declaring them on the Tool objects lets the approval request
+# carry the concrete resource key (rewritten command, URL origin, target path).
+#
+# The hint is a plain string when the payload is missing the relevant field so
+# the executor still gets a stable key for a malformed request (fail closed on
+# approval, never on key computation).
+
+
+def _permission_hint_command(payload: dict[str, Any]) -> str | None:
+    """Resource key = the rewritten command (approve ``cat a``, not ``rm -rf``)."""
+    command = str(payload.get("command") or "").strip()
+    return command or None
+
+
+def _permission_hint_origin(payload: dict[str, Any]) -> str | None:
+    """Resource key = the URL origin (approve one host, never an intranet)."""
+    url = str(payload.get("url") or "").strip()
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    netloc = parsed.netloc or parsed.path
+    return netloc or url
+
+
+def _permission_hint_remote(payload: dict[str, Any]) -> str | None:
+    """Resource key = the git remote name."""
+    remote = str(payload.get("remote") or "").strip()
+    return remote or None
+
+
+def _permission_hint_path(payload: dict[str, Any]) -> str | None:
+    """Resource key = the target path."""
+    path = str(payload.get("path") or payload.get("file_path") or "").strip()
+    return path or None
+
+
 def get_builtin_tools() -> list[Tool]:
     return [
         Tool(
@@ -567,6 +731,7 @@ def get_builtin_tools() -> list[Tool]:
             handler=write_file,
             is_read_only=False,
             danger_level="medium",
+            permission_hint=_permission_hint_path,
             capabilities=("filesystem",),
         ),
         Tool(
@@ -587,11 +752,18 @@ def get_builtin_tools() -> list[Tool]:
             is_read_only=False,
             is_concurrency_safe=False,
             danger_level="medium",
+            permission_hint=_permission_hint_path,
             capabilities=("filesystem",),
         ),
         Tool(
             name="grep",
-            description="Search workspace files and provide matching text excerpts to the current model.",
+            description=(
+                "Search workspace files and provide matching text excerpts to "
+                "the current model.  Large result sets are persisted to "
+                "Modus's private artifact store and returned as a compact "
+                "handle (path, sha256, size, preview) instead of being "
+                "injected in full."
+            ),
             parameters=object_schema(
                 {"pattern": {"type": "string"}, "path": {"type": "string"}, "regex": {"type": "boolean"}, "limit": {"type": "number"}},
                 ["pattern"],
@@ -632,7 +804,13 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="search_code",
-            description="Search source files and provide matching code lines to the current model.",
+            description=(
+                "Search source files and provide matching code lines to the "
+                "current model.  Large result sets are persisted to Modus's "
+                "private artifact store and returned as a compact handle "
+                "(path, sha256, size, preview) instead of being injected in "
+                "full."
+            ),
             parameters=object_schema(
                 {
                     "query": {"type": "string", "description": "Literal text or regular expression"},
@@ -676,6 +854,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            permission_hint=_permission_hint_command,
             capabilities=("exec",),
         ),
         Tool(
@@ -695,6 +874,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="high",
             requires_approval=True,
+            permission_hint=_permission_hint_command,
             timeout=3700.0,
             capabilities=("exec",),
         ),
@@ -741,6 +921,7 @@ def get_builtin_tools() -> list[Tool]:
             ),
             required_keys=["url"],
             handler=web_fetch,
+            permission_hint=_permission_hint_origin,
             capabilities=("network",),
         ),
         Tool(
@@ -838,6 +1019,26 @@ def get_builtin_tools() -> list[Tool]:
             capabilities=("exec",),
         ),
         Tool(
+            name="restart_process",
+            description=(
+                "Restart a supervised background process (T5): terminate the "
+                "current process group and start a fresh one with a reset "
+                "startup budget.  Refuses to restart a process in a fatal or "
+                "pid_reused state."
+            ),
+            parameters=object_schema(
+                {"process_id": {"type": "string"}},
+                ["process_id"],
+            ),
+            required_keys=["process_id"],
+            handler=restart_process,
+            is_read_only=False,
+            is_concurrency_safe=False,
+            danger_level="medium",
+            requires_approval=True,
+            capabilities=("exec",),
+        ),
+        Tool(
             name="rebuild_code_index",
             description=(
                 "Build or refresh the persistent code-search index for the "
@@ -867,6 +1068,7 @@ def get_builtin_tools() -> list[Tool]:
             required_keys=["url"],
             handler=browser_navigate,
             is_concurrency_safe=False,
+            permission_hint=_permission_hint_origin,
             capabilities=("exec", "network"),
         ),
         Tool(
@@ -1078,6 +1280,7 @@ def get_builtin_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="medium",
             requires_approval=True,
+            permission_hint=_permission_hint_path,
             capabilities=("filesystem", "exec"),
         ),
         # System control tools (Phase A5): ports read-only, service restart T4.
@@ -1121,6 +1324,40 @@ def get_builtin_tools() -> list[Tool]:
             requires_approval=True,
             capabilities=("exec",),
         ),
+        # Coverage matrix (Wave3 A3): read-only work-completion record.  A pure
+        # log — it never gates approval or capabilities, so no permission_hint
+        # and no approval requirement.  ``mark``/``clear`` mutate only Modus's
+        # private coverage ledger under ~/.modus/coverage.
+        Tool(
+            name="coverage",
+            description=(
+                "Record and query the work-completion coverage matrix "
+                "(objective, operation, capability).  ACTIONS: mark, list, "
+                "untested, summary, clear.  mark records a combination as "
+                "tried/passed/failed/skipped; untested crosses candidate "
+                "objectives x capabilities and lists what has not been "
+                "attempted yet; summary aggregates; clear resets the session "
+                "matrix.  Read-only record of work done — never affects "
+                "approval or capability gating."
+            ),
+            parameters=object_schema(
+                {
+                    "action": {"type": "string", "description": "mark, list, untested, summary, or clear"},
+                    "objective": {"type": "string", "description": "Goal this work belongs to (mark)"},
+                    "operation": {"type": "string", "description": "Operation performed (mark, optional)"},
+                    "capability": {"type": "string", "description": "Capability exercised, e.g. filesystem/exec/network/memory/agent (mark)"},
+                    "state": {"type": "string", "description": "tried, passed, failed, or skipped (mark)"},
+                    "objectives": {"type": "array", "description": "Candidate objectives to cross (untested)"},
+                    "capabilities": {"type": "array", "description": "Candidate capabilities to cross (untested)"},
+                },
+                [],
+            ),
+            handler=coverage,
+            is_read_only=True,
+            is_concurrency_safe=True,
+            danger_level="safe",
+            capabilities=("filesystem",),
+        ),
     ] + _clone_tools()
 
 
@@ -1141,6 +1378,9 @@ def _clone_tools() -> list[Tool]:
         return object_schema(props, required)
 
     def _tool(name, description, props, required, *, read_only=False, high=False):
+        # git_fetch/git_pull/git_push are remote-scoped (A1): approving one
+        # remote never reuses for another.
+        hint = _permission_hint_remote if name in {"git_fetch", "git_pull", "git_push"} else None
         return Tool(
             name=name,
             description=description,
@@ -1168,6 +1408,7 @@ def _clone_tools() -> list[Tool]:
             is_concurrency_safe=False,
             danger_level="safe" if read_only else ("high" if high else "medium"),
             requires_approval=not read_only,
+            permission_hint=hint,
             # git shelled out + host network + (for writes) workspace mutation
             capabilities=("filesystem", "exec", "network"),
         )
@@ -1260,6 +1501,12 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
             compiled = re.compile(query, 0 if case_sensitive else re.IGNORECASE) if use_regex else None
         except re.error as exc:
             return ToolResult(f"invalid regex: {exc}", is_error=True)
+
+        # C3 result bridge: reuse an intact content-addressed handle for an
+        # identical read before scanning or querying the index.
+        cached = _cached_handle_result("search_code", context, payload)
+        if cached is not None:
+            return cached
         # Exact-symbol mode: only match whole words/identifiers, so ``find_me``
         # does not hit ``find_me_again`` and ``user`` does not hit ``User``.
         # For a literal query this becomes a word-boundary regex; a regex query
@@ -1320,12 +1567,18 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
                     else:
                         matches.append(f"{relative}:{row.line}:\n{row.content}")
                     if len(matches) >= limit:
-                        return ToolResult(
-                            "\n".join(matches) + f"\n... [limited to {limit} matches]"
-                        )
+                        text = "\n".join(matches) + f"\n... [limited to {limit} matches]"
+                        bridged = _bridge_oversized("search_code", text, context, payload)
+                        if bridged is not None:
+                            return bridged
+                        return ToolResult(text)
                 if not matches:
                     return ToolResult("(no matches)")
-                return ToolResult("\n".join(matches))
+                text = "\n".join(matches)
+                bridged = _bridge_oversized("search_code", text, context, payload)
+                if bridged is not None:
+                    return bridged
+                return ToolResult(text)
 
         async def _all_candidates():
             if start.is_file():
@@ -1357,13 +1610,21 @@ async def search_code(payload: dict[str, Any], context: ToolContext) -> ToolResu
                 else:
                     matches.append(f"{relative}:{line_number}: {line.strip()}")
                 if len(matches) >= limit:
-                    return ToolResult("\n".join(matches) + f"\n... [limited to {limit} matches]")
+                    text = "\n".join(matches) + f"\n... [limited to {limit} matches]"
+                    bridged = _bridge_oversized("search_code", text, context, payload)
+                    if bridged is not None:
+                        return bridged
+                    return ToolResult(text)
         if truncated["hit"]:
             cap = _scan_cap(context)
             footer = f"\n... [扫描达上限 {cap} 文件，结果不完整]"
         else:
             footer = ""
-        return ToolResult("\n".join(matches) + footer if matches else (f"(no matches){footer}"))
+        text = "\n".join(matches) + footer if matches else (f"(no matches){footer}")
+        bridged = _bridge_oversized("search_code", text, context, payload)
+        if bridged is not None:
+            return bridged
+        return ToolResult(text)
     except PathPolicyError as exc:
         return _path_error(exc)
 
@@ -1393,15 +1654,25 @@ async def rebuild_code_index(payload: dict[str, Any], context: ToolContext) -> T
     )
 
 async def load_skill(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    """Load a user skill prompt from the non-executable local skill repository."""
+    """Load a user skill prompt from the non-executable local skill repository.
+
+    Loading counts as skill *use*: ``mark_used`` bumps the usage sidecar so the
+    Wave5 E2 curator keeps actively-used skills ``active``.
+    """
     from modus.skills import SkillRepository
 
     try:
-        skill = SkillRepository().get(str(payload["name"]))
+        repository = SkillRepository()
+        skill = repository.get(str(payload["name"]))
     except ValueError as exc:
         return ToolResult(str(exc), is_error=True)
     if skill is None:
         return ToolResult(f'Skill "{payload["name"]}" not found.', is_error=True)
+    try:
+        repository.mark_used(str(payload["name"]))
+    except Exception:
+        # Usage tracking is best-effort; a failed sidecar write never breaks load.
+        pass
     return ToolResult(skill.prompt, display_summary=skill.description or skill.name)
 
 

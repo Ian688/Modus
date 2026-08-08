@@ -704,7 +704,7 @@ class TimelineRenderer {
     node.setAttribute("role", "status");
     const completionTitle = outcome.summary || "任务完成";
     const evidenceAction = latestEvidence ? '<button type="button" data-completion-evidence="' + escapeHtml(latestEvidence.evidence_id || "") + '">查看验证</button>' : '';
-    node.innerHTML = '<div class="run-completion-mark" aria-hidden="true">✓</div><div class="run-completion-main"><span class="run-completion-title">' + escapeHtml(completionTitle) + '</span><div class="run-completion-stats">' + stats.join("") + (ledgerKeys.length ? '<button type="button" class="rc-ledger-toggle" data-expanded="false">分项</button>' : '') + '</div>' + ledgerHtml + '<div class="run-completion-actions"><button type="button" data-completion-task>查看任务树</button>' + evidenceAction + (artifacts.length ? '<button type="button" data-completion-artifact="' + escapeHtml(artifacts[artifacts.length - 1].artifact_id || "") + '">打开最终产物</button>' : '') + '</div></div>';
+    node.innerHTML = '<div class="run-completion-mark" aria-hidden="true">✓</div><div class="run-completion-main"><span class="run-completion-title">' + escapeHtml(completionTitle) + '</span><div class="run-completion-stats">' + stats.join("") + (ledgerKeys.length ? '<button type="button" class="rc-ledger-toggle" data-expanded="false">分项</button>' : '') + '</div>' + ledgerHtml + '<div class="run-completion-actions"><button type="button" data-completion-task>查看任务树</button>' + evidenceAction + '<button type="button" data-branch-continue="' + escapeHtml(event.run_id || "") + '">分叉继续</button>' + (artifacts.length ? '<button type="button" data-completion-artifact="' + escapeHtml(artifacts[artifacts.length - 1].artifact_id || "") + '">打开最终产物</button>' : '') + '</div></div>';
     node.querySelector("[data-completion-task]")?.addEventListener("click", () => {
       workbenchStore.selectRun(event.run_id);
       if (window.innerWidth <= 1100) setWorkbenchPanel(true);
@@ -889,6 +889,23 @@ class TimelineRenderer {
           : message + detailHtml;
         // html=true whenever we may emit markup (retry card or error detail).
         return {icon:reason === "cancelled" ? "○" : "⚠", label:labels[reason] || "运行错误", kind:"system", html:canRetry || Boolean(detail), markdown};
+      }
+      case "process_completed": {
+        const proc = event.payload || {};
+        const ok = proc.exit_code === 0;
+        return {
+          icon: ok ? "✓" : "✗",
+          label: "后台进程完成",
+          kind: "system",
+          markdown:
+            "<strong>后台进程完成</strong><br>"
+            + escapeHtml(proc.task_name || proc.command || "(未命名)") + " · exit "
+            + escapeHtml(String(proc.exit_code ?? "?"))
+            + (proc.run_id ? "<br><small>run " + escapeHtml(proc.run_id) + "</small>" : "")
+            + '<br><button type="button" class="plain-small resume-process" data-resume-process="'
+            + escapeHtml(proc.process_id || "") + '">继续</button>',
+          html: true,
+        };
       }
       default: return {icon:"•", label:event.actor.label || "事件", kind:"system", markdown:""};
     }
@@ -1282,6 +1299,28 @@ function addCopyHandlers(container) {
       const decision = btn.dataset.approvalDecision;
       ws.send(JSON.stringify({type:"approval_response", run_id:runId, approval_id:approvalId, decision}));
       timelineRenderer.markApprovalDecision(approvalId, decision);
+    };
+  });
+  container.querySelectorAll("[data-resume-process]").forEach(btn => {
+    btn.onclick = () => {
+      const processId = btn.dataset.resumeProcess;
+      const runId = btn.closest("[data-run-id]")?.dataset.runId || "";
+      if (!processId || !ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({type:"resume_process", process_id:processId, run_id:runId}));
+      btn.disabled = true;
+      btn.textContent = "已请求…";
+    };
+  });
+  container.querySelectorAll("[data-branch-continue]").forEach(btn => {
+    btn.onclick = () => {
+      const fromRunId = btn.dataset.branchContinue;
+      if (!fromRunId || !ws || ws.readyState !== WebSocket.OPEN) return;
+      // Fork a new branch continuing from this run's context: send an empty
+      // steer (E3) so the runner opens a new run on the forked branch and the
+      // user can pick up where the completed run left off.
+      ws.send(JSON.stringify({type:"run_message", content:"", steer:true, branch_from:fromRunId}));
+      btn.disabled = true;
+      btn.textContent = "已分叉…";
     };
   });
   container.querySelectorAll("[data-choice-card] .choice-btn").forEach(btn => {

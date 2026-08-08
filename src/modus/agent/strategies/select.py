@@ -1,15 +1,19 @@
 """Deterministic reasoner selection for the agent loop.
 
-Chooses ReAct vs PlanExecute from the request shape and config, so the default
-base adapts without a router model.  ``select_reasoner`` is a pure function:
-given the user request, conversation history, and config, it returns which
-reasoner class to use.  Explicit ``reasoner_factory`` and ``agent_mode`` always
-win; this heuristic only fills the gap when neither is set.
+Chooses ReAct vs PlanExecute (vs GoalReasoner under ``agent_mode="goal"``)
+from the request shape and config, so the default base adapts without a router
+model.  ``select_reasoner`` is a pure function: given the user request,
+conversation history, and config, it returns which reasoner class to use.
+Explicit ``reasoner_factory`` and ``agent_mode`` always win; this heuristic only
+fills the gap when neither is set.
 
 Heuristic (deliberately conservative):
 - A request with multi-step cues and file-mutation intent -> PlanExecute.
 - A conversational / single-step request -> ReAct.
-- ``agent_mode="plan"`` -> PlanExecute; anything else -> ReAct.
+- ``agent_mode="plan"`` -> PlanExecute.
+- ``agent_mode="goal"`` -> GoalReasoner (a thin goal-aware wrapper around ReAct
+  that keeps the cross-turn goal state in the loop).
+- anything else -> ReAct.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ def select_reasoner(
     if explicit_factory is not None:
         return explicit_factory
 
+    from modus.agent.goal import GoalReasoner
     from modus.agent.strategies import PlanExecuteReasoner, ReActReasoner
 
     request_text = str(request or "")
@@ -52,6 +57,10 @@ def select_reasoner(
     mode = str(getattr(getattr(config, "prompt", None), "agent_mode", "react"))
     if mode == "plan":
         return PlanExecuteReasoner
+    if mode == "goal":
+        # Goal-driven mode: wrap ReAct so the same safety boundaries hold while
+        # the cross-turn goal state is kept in the loop.
+        return GoalReasoner
     if _looks_multi_step(request_text) and _looks_file_intent(request_text):
         return PlanExecuteReasoner
     return ReActReasoner

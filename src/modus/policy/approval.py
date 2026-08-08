@@ -56,6 +56,17 @@ class SessionGrant:
     created_at: float
     pattern: str | None = None  # set when the grant came from a command rule
 
+    def audit_scope(self) -> str:
+        """The approval scope level this grant encodes (A1 audit dimension).
+
+        A per-resource session grant is ``per-resource``; a rule-based grant
+        (a remembered command pattern) is recorded under ``per-resource`` too,
+        because it still only ever reuses for the exact matching resource —
+        never a broader tool.  The audit log stores this so a replay can show
+        the scope under which a remembered approval was reused.
+        """
+        return ApprovalScope.PER_RESOURCE.value
+
 
 @dataclass
 class SessionGrantStore:

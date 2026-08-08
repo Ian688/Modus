@@ -121,6 +121,7 @@ async def lifespan(_app: FastAPI):
     from modus.desktop.db import interrupt_nonterminal_runs
     from modus.health import Probes, install_watchdog
 
+    _acquire_db_writer()
     init_db()
     if _desktop_default_workspace_root:
         upsert_workspace(WorkspaceIdentity.from_path(_desktop_default_workspace_root))
@@ -128,11 +129,26 @@ async def lifespan(_app: FastAPI):
     await mcp_manager.connect_all()
     Probes.notify = _schedule_user_notice
     install_watchdog()
+    # G3 wake-up: the background process reaper calls this sync sink (in an
+    # asyncio task) for each terminal process; we forward the completion as a
+    # WS timeline packet and, when authorized, trigger a bounded resume run.
+    from modus.tools.process_tools import set_process_event_sink
+
+    def _process_event_sink(event: dict) -> None:
+        try:
+            asyncio.get_event_loop().create_task(_handle_process_completed_event(event))
+        except RuntimeError:
+            logger.warning("process_completed dropped: no running event loop: %s", event.get("process_id"))
+
+    set_process_event_sink(_process_event_sink)
     try:
         yield
     finally:
+        from modus.desktop import db
         from modus.health import _watchdog
 
+        set_process_event_sink(None)
+        db.release_writer_lease()
         await _watchdog.stop()
         Probes.notify = None
         await mcp_manager.disconnect_all()
@@ -1386,7 +1402,10 @@ async def _handle_kanban_board(
     if session.db_id:
         snapshot = build_workbench_snapshot(session.db_id)
         runs = snapshot.get("runs") or []
-    board = aggregate_board(runs)
+    board = aggregate_board(
+        runs,
+        coverage_summary=_session_coverage_summary(session),
+    )
     await websocket.send_json({
         "type": "kanban_board",
         "operation": "kanban_board", "request_id": request_id,
@@ -1396,6 +1415,75 @@ async def _handle_kanban_board(
 
 
 command_router.register("kanban_board", _handle_kanban_board)
+
+
+def _session_coverage_summary(session: DaoSession) -> dict[str, Any]:
+    """Read the current session's coverage matrix summary, if any.
+
+    Read-only: a transient session (no persisted db_id) or a coverage store
+    that has not been opened yet simply contributes an empty section.  The
+    board never mutates the coverage ledger.
+    """
+    session_id = str(session.db_id or "").strip()
+    if not session_id:
+        return {}
+    try:
+        from modus.tools.coverage import _coverage_store
+
+        return _coverage_store(session_id).summary()
+    except Exception:
+        return {}
+
+
+async def _handle_coverage(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Serve the work-completion coverage summary (Wave3 A3) for this session.
+
+    Read-only list/query surface: returns the session coverage matrix summary
+    and the untested combinations the frontend / future /next command consume.
+    """
+    from modus.tools.coverage import _coverage_store
+
+    request_id = str(message.get("request_id") or "")[:128]
+    operation = str(message.get("operation") or "summary")
+    # The coverage ledger is scoped to a persisted session (db_id) — the same
+    # key the runner's ToolContext.session_id carries.  A transient session has
+    # no durable coverage store.
+    session_id = str(session.db_id or "").strip()
+    if not session_id:
+        await websocket.send_json({
+            "type": "coverage",
+            "operation": "summary", "request_id": request_id,
+            "session_id": "", "data": None,
+            "error": "coverage requires a persisted session",
+        })
+        return
+    store = _coverage_store(session_id)
+    if operation == "untested":
+        objectives = list(message.get("objectives") or [])
+        capabilities = list(message.get("capabilities") or [])
+        untested = store.untested(objectives, capabilities) if objectives and capabilities else []
+        await websocket.send_json({
+            "type": "coverage",
+            "operation": "untested", "request_id": request_id,
+            "session_id": session_id,
+            "data": {
+                "untested": [{"objective": o, "capability": c} for o, c in untested],
+                "untested_count": len(untested),
+            },
+        })
+        return
+    summary = store.summary()
+    await websocket.send_json({
+        "type": "coverage",
+        "operation": "summary", "request_id": request_id,
+        "session_id": session_id,
+        "data": summary,
+    })
+
+
+command_router.register("coverage", _handle_coverage)
 
 
 async def _handle_worker_pool(
@@ -1439,6 +1527,468 @@ async def _handle_worker_pool(
 
 
 command_router.register("worker_pool", _handle_worker_pool)
+
+
+# ── Session tree: branch / revert / tree (Wave5 E3) ───────────────────────
+
+
+async def _handle_session_branch(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Fork a new session branch from one message (leaf pointer only).
+
+    The branch is a pure pointer move: no message row is copied, no history is
+    deleted, and the previous branch remains on disk (fully reversible via
+    ``session_revert``).  Subsequent ``add_message`` appends land on the new
+    branch.  Refused while the session owns a running run so a fork can never
+    race the message log.
+    """
+    from modus.desktop.db import session_branch as db_session_branch
+
+    request_id = str(message.get("request_id") or "")[:128]
+    context = {
+        "operation": "session_branch", "request_id": request_id,
+        **_session_identity(session),
+    }
+    if not session.db_id:
+        await websocket.send_json({
+            "type": "error", "code": "session_not_persisted",
+            "message": "未持久化的会话不能分支。", **context,
+        })
+        return
+    if await _reject_session_mutation_while_running(
+        websocket, session, "分支",
+        error_context={"operation": "session_branch", "request_id": request_id},
+    ):
+        return
+    try:
+        message_id = int(message.get("message_id"))
+    except (TypeError, ValueError):
+        await websocket.send_json({
+            "type": "error", "code": "invalid_message_id",
+            "message": "分支需要有效的消息 ID。", **context,
+        })
+        return
+    row = db_session_branch(session.db_id, message_id)
+    if row is None:
+        await websocket.send_json({
+            "type": "error", "code": "message_not_found",
+            "message": "未找到要分支的消息。", **context,
+        })
+        return
+    await websocket.send_json({
+        "type": "session_branched",
+        "branch": {
+            "branch_id": str(row.get("branch_id") or ""),
+            "message_id": int(row.get("message_id") or 0) or None,
+            "branch_root_id": row.get("branch_root_id"),
+            "branch_name": "分支",
+        },
+        "session_id": session.db_id, "request_id": request_id,
+    })
+
+
+command_router.register("session_branch", _handle_session_branch)
+
+
+async def _handle_session_revert(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Rewind the session's leaf pointer to one message without deleting it.
+
+    ``session_revert`` moves the current-branch leaf onto ``message_id``; every
+    downstream message stays in the database and ``session_tree`` still shows
+    it, so the operation is a reversible rewind rather than a delete.
+    """
+    from modus.desktop.db import session_revert as db_session_revert
+
+    request_id = str(message.get("request_id") or "")[:128]
+    context = {
+        "operation": "session_revert", "request_id": request_id,
+        **_session_identity(session),
+    }
+    if not session.db_id:
+        await websocket.send_json({
+            "type": "error", "code": "session_not_persisted",
+            "message": "未持久化的会话不能回溯。", **context,
+        })
+        return
+    if await _reject_session_mutation_while_running(
+        websocket, session, "回溯",
+        error_context={"operation": "session_revert", "request_id": request_id},
+    ):
+        return
+    try:
+        message_id = int(message.get("message_id"))
+    except (TypeError, ValueError):
+        await websocket.send_json({
+            "type": "error", "code": "invalid_message_id",
+            "message": "回溯需要有效的消息 ID。", **context,
+        })
+        return
+    row = db_session_revert(session.db_id, message_id)
+    if row is None:
+        await websocket.send_json({
+            "type": "error", "code": "message_not_found",
+            "message": "未找到要回溯到的消息。", **context,
+        })
+        return
+    await websocket.send_json({
+        "type": "session_reverted",
+        "branch": {
+            "branch_id": str(row.get("branch_id") or ""),
+            "message_id": int(row.get("message_id") or 0) or None,
+            "branch_root_id": row.get("branch_root_id"),
+            "branch_name": "回溯",
+        },
+        "session_id": session.db_id, "request_id": request_id,
+    })
+
+
+command_router.register("session_revert", _handle_session_revert)
+
+
+async def _handle_session_tree(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Serve the full session message tree (all branches, no deletions)."""
+    from modus.desktop.db import session_tree as db_session_tree
+
+    request_id = str(message.get("request_id") or "")[:128]
+    context = {
+        "operation": "session_tree", "request_id": request_id,
+        **_session_identity(session),
+    }
+    if not session.db_id:
+        await websocket.send_json({
+            "type": "error", "code": "session_not_persisted",
+            "message": "未持久化的会话没有会话树。", **context,
+        })
+        return
+    try:
+        limit = max(1, min(int(message.get("limit") or 500), 2_000))
+    except (TypeError, ValueError):
+        limit = 500
+    tree = db_session_tree(session.db_id, limit=limit)
+    await websocket.send_json({
+        "type": "session_tree",
+        "session_id": session.db_id, "request_id": request_id,
+        "tree": tree,
+    })
+
+
+command_router.register("session_tree", _handle_session_tree)
+
+
+# ── G3: background-process completion → wake-up / resume ──────────────────
+
+
+def _connected_session_by_db_id(db_id: str) -> DaoSession | None:
+    """Return a live DaoSession bound to a persisted conversation, if any."""
+    if not db_id:
+        return None
+    for candidate in manager._sessions.values():
+        if str(candidate.db_id or "") == str(db_id):
+            return candidate
+    return None
+
+
+def _resume_budget_halved(controller: RunController) -> None:
+    """Halve a fresh controller's run budget for a bounded resume (G3).
+
+    A resumed continuation is deliberately smaller than a full run so an
+    authorized ``resume_on_complete`` chain cannot compound into an unlimited
+    spend — each hop carries half the prior limits, in addition to the
+    one-resume-per-process bound enforced in the registry.
+    """
+    from modus.runtime.budget import RunBudget, RunLimits
+
+    limits = controller.budget.limits
+    controller.budget = RunBudget(RunLimits(
+        max_turns=max(1, limits.max_turns // 2),
+        max_tokens=max(1, limits.max_tokens // 2),
+        max_wall_seconds=max(1.0, limits.max_wall_seconds / 2.0),
+        max_verification_attempts=limits.max_verification_attempts,
+    ))
+
+
+def _resume_context_message(process_id: str, meta: dict[str, Any], exit_code: int) -> str:
+    """Build the continuation prompt carrying the completed process context."""
+    command = str(meta.get("command") or "")[:200]
+    task_name = str(meta.get("task_name") or "")[:200]
+    label = f"{task_name}（{command}）" if task_name else command
+    if int(exit_code or 0) == 0:
+        verdict = "已成功完成"
+    else:
+        verdict = f"以退出码 {exit_code} 结束（失败）"
+    return (
+        f"继续处理之前的任务。后台进程 {process_id} {verdict}：{label}\n"
+        f"命令：{command}\n"
+        f"进程已完成，请继续下一步（例如编译完成后部署）。"
+    )
+
+
+async def _push_process_completed(
+    websocket: Any, session: DaoSession, event: dict[str, Any],
+) -> None:
+    """Push the process-completed timeline row to one connected window."""
+    try:
+        await websocket.send_json({
+            "type": "process_completed",
+            "process_id": str(event.get("process_id") or ""),
+            "run_id": str(event.get("run_id") or ""),
+            "task_name": event.get("task_name"),
+            "exit_code": event.get("exit_code"),
+            "status": str(event.get("status") or "completed"),
+            "resume_on_complete": bool(event.get("resume_on_complete") or False),
+            "session_id": str(session.db_id or ""),
+        })
+    except Exception:
+        logger.debug("process_completed push failed", exc_info=True)
+
+
+async def _handle_process_completed_event(event: dict[str, Any]) -> None:
+    """Route one terminal-process event: timeline push + optional bounded resume.
+
+    Called (via ``asyncio`` task) from the sync process reaper sink.  Pushes a
+    ``process_completed`` control packet to every connected window owning the
+    spawning session so the user can click "继续".  When the process was spawned
+    with ``resume_on_complete`` the server consumes the registry's single
+    bounded resume and starts a new halved-budget run immediately.
+    """
+    process_id = str(event.get("process_id") or "")
+    spawn_run_id = str(event.get("run_id") or "")
+    if not process_id:
+        return
+    # The event carries the spawning run id; the durable run row names the
+    # conversation that owns the spawned job.
+    session_id = ""
+    try:
+        if spawn_run_id:
+            spawn_run = get_run(spawn_run_id)
+            if spawn_run is not None:
+                session_id = str(spawn_run.get("session_id") or "")
+    except Exception:
+        logger.debug("process_completed run lookup failed", exc_info=True)
+    # Only a persisted conversation the process belongs to receives the
+    # wake-up row.  A process spawned without a desktop run (no run_id, so no
+    # resolved session) has no owning window to notify — it is not broadcast
+    # to every session.
+    if not session_id:
+        return
+    pushed: list[Any] = []
+    for candidate in manager._sessions.values():
+        if str(candidate.db_id or "") != session_id:
+            continue
+        socket = manager._websockets.get(candidate.id)
+        if socket is None:
+            continue
+        pushed.append(candidate)
+        await _push_process_completed(socket, candidate, event)
+    if not bool(event.get("resume_on_complete")):
+        return
+    # Authorized automatic continuation only after a *successful* completion.
+    # A failed job still surfaces its timeline row (so the user can click
+    # "继续" manually) but is never auto-retried: auto-resuming a broken build
+    # could spin the agent on the same failing input.  The resume is consumed
+    # here, in the same async path that would start a run, so the durable
+    # one-resume bound is enforced exactly once per process.
+    if int(event.get("exit_code") or 0) != 0:
+        return
+    from modus.tools.process_tools import consume_process_resume
+
+    meta = consume_process_resume(process_id)
+    if meta is None:
+        return
+    owner = _connected_session_by_db_id(str(meta.get("session_id") or "") or session_id)
+    if owner is None:
+        owner = pushed[0] if pushed else None
+    if owner is None:
+        return
+    websocket = manager._websockets.get(owner.id)
+    if websocket is None:
+        return
+    message = _resume_context_message(process_id, meta, int(event.get("exit_code") or 0))
+    await _start_resume_run(websocket, owner, message, process_id=process_id)
+
+
+async def _handle_resume_process(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """User-clicked "继续" on a completed background process: resume as a new run.
+
+    The click is the human's explicit continuation intent, so this path does not
+    re-ask for approval; the actual tool calls in the resumed run still go
+    through the normal approval gates.  Mirrors the verification-retry admission
+    shape: a fresh run with halved budget carries the process-completion context.
+    """
+    from modus.tools.process_tools import _read_meta
+
+    process_id = str(message.get("process_id") or "").strip()
+    request_id = str(message.get("request_id") or "")[:128]
+    context = {
+        "operation": "resume_process", "request_id": request_id,
+        "process_id": process_id, **_session_identity(session),
+    }
+    meta = _read_meta(process_id) if process_id else None
+    if meta is None:
+        await websocket.send_json({
+            "type": "error", "code": "process_not_found",
+            "message": "未找到该后台进程记录。", **context,
+        })
+        return
+    status = str(meta.get("status") or "running")
+    if status not in {"completed", "failed"}:
+        await websocket.send_json({
+            "type": "error", "code": "process_not_terminal",
+            "message": "该后台进程尚未完成，无法续跑。", **context,
+        })
+        return
+    if not session.db_id or str(meta.get("session_id") or "") != session.db_id:
+        await websocket.send_json({
+            "type": "error", "code": "process_session_mismatch",
+            "message": "该后台进程不属于当前会话。", **context,
+        })
+        return
+    resume_message = _resume_context_message(
+        process_id, meta, int(meta.get("exit_code") or 0),
+    )
+    await _start_resume_run(websocket, session, resume_message, process_id=process_id)
+
+
+async def _start_resume_run(
+    websocket: WebSocket, session: DaoSession, resume_message: str, *, process_id: str,
+) -> None:
+    """Admit and run one resume continuation with a halved budget."""
+    context = {
+        "operation": "resume_process", "process_id": process_id,
+        **_session_identity(session),
+    }
+    async with manager.run_admission_lock:
+        owner = active_run_owner(session.db_id)
+        if _session_run_active(session) or owner is not None:
+            active = session.active_controller or getattr(owner, "active_controller", None)
+            await websocket.send_json({
+                "type": "error", "code": "session_busy",
+                "message": "当前会话仍有任务在运行，请稍后再续跑。",
+                "run_id": active.run_id if active is not None else None,
+                "run_owned_by_connection": _session_run_active(session),
+                **context,
+            })
+            return
+        orphan = _unrecovered_admission_run(session)
+        if orphan is not None:
+            await websocket.send_json({
+                "type": "error", "code": "run_admission_recovery_required",
+                "message": "上一任务的运行记录尚未完成恢复，模型不会启动。请重启 Desktop 后重试。",
+                "run_id": str(orphan.get("run_id") or ""),
+                "run_owned_by_connection": False, **context,
+            })
+            return
+        if session.extensions_revision < manager.extensions_revision:
+            await _rebuild_session_engine(session)
+            session.extensions_revision = manager.extensions_revision
+
+        emitter, controller = _run_resources(websocket, session, DEFAULT_MODE)
+        # Bounded continuation: halve the run budget for every resumed hop.
+        _resume_budget_halved(controller)
+        controller.transition(RunState.RUNNING)
+        try:
+            run = _persist_run_start(session, emitter, controller, DEFAULT_MODE)
+        except Exception:
+            logger.exception("resume run admission persistence failed")
+            run = {}
+        if not _canonical_run_admission(session, emitter, controller, run):
+            if not controller.is_terminal:
+                controller.transition(RunState.FAILED)
+            recovered = _fail_run_admission_checked(
+                emitter.run_id, session_id=str(session.db_id or ""),
+                stop_reason="admission_persistence_failed",
+            )
+            retain_barrier = (
+                not recovered
+                and _admission_failure_requires_barrier(
+                    emitter.run_id, str(session.db_id or ""),
+                )
+            )
+            if retain_barrier:
+                _retain_admission_recovery_barrier(
+                    websocket, session, emitter, controller,
+                )
+            elif session.active_run_id == emitter.run_id:
+                session.active_run_id = None
+            await websocket.send_json({
+                "type": "error", "code": "resume_admission_failed",
+                "message": "续跑未能建立完整运行记录，模型尚未启动，请重试。",
+                "run_id": emitter.run_id, **context,
+            })
+            return
+
+        admitted = False
+        gate = asyncio.Event()
+
+        async def admitted_resume() -> Any:
+            await gate.wait()
+            if not admitted:
+                if not controller.is_terminal:
+                    controller.transition(RunState.FAILED)
+                _fail_run_admission_checked(
+                    emitter.run_id, session_id=str(session.db_id or ""),
+                    stop_reason="admission_transport_failed",
+                )
+                if session.active_controller is controller:
+                    session.active_controller = None
+                return emitter
+            return await _stream_to_ws(
+                websocket, session, resume_message, mode=DEFAULT_MODE,
+                emitter=emitter, controller=controller,
+                emit_user_message=False, persisted_run=True,
+                manage_controller=True,
+            )
+
+        session.active_controller = controller
+        started = start_session_run(
+            session, admitted_resume(),
+            release_guard=_run_release_guard(session),
+            on_settled=_run_settlement_callback(websocket, session),
+        )
+        if not started:
+            if not controller.is_terminal:
+                controller.transition(RunState.FAILED)
+            recovered = _fail_run_admission_checked(
+                emitter.run_id, session_id=str(session.db_id or ""),
+                stop_reason="admission_conflict",
+            )
+            if session.active_controller is controller:
+                session.active_controller = None
+            if recovered or _admission_failure_requires_barrier(
+                emitter.run_id, str(session.db_id or ""),
+            ):
+                _retain_admission_recovery_barrier(
+                    websocket, session, emitter, controller,
+                )
+            await websocket.send_json({
+                "type": "error", "code": "session_busy",
+                "message": "已有任务正在运行，请稍后重试。",
+                "run_id": emitter.run_id,
+                "run_owned_by_connection": _session_run_active(session),
+                **context,
+            })
+            return
+        try:
+            await websocket.send_json({
+                "type": "resume_started",
+                "run_id": emitter.run_id,
+                "process_id": process_id,
+                "message": "已开始续跑：后台进程已完成，模型继续处理。",
+                **context,
+            })
+            admitted = True
+        finally:
+            gate.set()
+
+
+command_router.register("resume_process", _handle_resume_process)
 
 
 async def _handle_credential_migration_report(
@@ -1842,6 +2392,22 @@ def _approval_e2e_workspace() -> Path | None:
     return workspace
 
 
+def _acquire_db_writer() -> None:
+    """Take the desktop.db writer lease or fail the server with a clear error.
+
+    Exactly one Modus instance (Desktop / CLI / MCP spawn) may write the shared
+    database at a time.  A second writer is refused with an explicit message
+    instead of silently racing (lost updates).  Read-only queries need no lease.
+    """
+    from modus.desktop import db
+
+    if not db.acquire_writer_lease():
+        raise RuntimeError(
+            "另一个 Modus 实例正在运行并占用数据库（%s）。"
+            "请先关闭它，再启动本实例。" % db.DB_PATH
+        )
+
+
 def start_server(
     *, host: str = "127.0.0.1", port: int = 3000,
     workspace_root: str | Path | None = None,
@@ -1853,6 +2419,7 @@ def start_server(
     from modus.process_cleanup import install_process_cleanup
 
     install_process_cleanup()
+    _acquire_db_writer()
     _desktop_default_workspace_root = (
         WorkspaceIdentity.from_path(workspace_root).root
         if workspace_root is not None else None
@@ -2450,6 +3017,87 @@ def _run_submission_context(
     }
 
 
+def _run_genuinely_live(session: DaoSession, owner: DaoSession | None) -> bool:
+    """True when a real provider run is executing (not a fail-closed barrier).
+
+    A fail-closed admission barrier installs a *completed* task that owns the
+    session until process-start repair.  Its ``active_run_task.done()`` is True
+    and its controller is terminal, so steering/follow-up turns must NOT be
+    queued behind it — the existing ``session_busy`` rejection stays correct.
+    A genuinely live run has an unfinished task (or an unfinished owner task)
+    while its provider executes.
+    """
+    task = session.active_run_task
+    if task is not None and not task.done():
+        return True
+    if owner is not None:
+        owner_task = getattr(owner, "active_run_task", None)
+        if owner_task is not None and not owner_task.done():
+            return True
+    return False
+
+
+def _enqueue_mid_run_turn(
+    session: DaoSession, content: str, *, steer: bool,
+) -> str | None:
+    """Queue a user turn submitted while a run is live; returns the mode name.
+
+    ``steer=True`` routes into the steering queue so the active reasoner
+    injects it after the current turn's tool results and before the next LLM
+    call.  ``steer=False`` (or absent) routes into the follow-up queue so it is
+    drained after the run settles into a fresh continuation.  A session that
+    has not been persisted has no durable queue key and is rejected.
+    """
+    if not session.db_id:
+        return None
+    from modus.agent.strategies.react import (
+        enqueue_followup, enqueue_steer,
+    )
+
+    message = Message(role="user", content=content)
+    if steer:
+        enqueue_steer(session.db_id, message)
+        return "steer"
+    enqueue_followup(session.db_id, message)
+    return "followup"
+
+
+async def _drain_followups(websocket: WebSocket, session: DaoSession) -> None:
+    """Start one continuation run per queued follow-up turn after settlement.
+
+    Called from the run-settlement notification (ownership already released),
+    so each queued follow-up becomes a fresh, normally-admitted run carrying
+    the previous run's final context.  Best-effort: a drain failure is logged
+    and never breaks the settlement notification.  Steer turns are intentionally
+    NOT drained here — they were consumed mid-run by the reasoner.
+    """
+    if not session.db_id:
+        return
+    from modus.agent.strategies.react import drain_followup_for
+
+    queued = drain_followup_for(session.db_id)
+    for item in queued:
+        content = str(item.content) if isinstance(item.content, str) else ""
+        if not content.strip():
+            continue
+        try:
+            await _handle_explicit_run_message(
+                websocket, session,
+                {
+                    "type": "run_message",
+                    "content": content,
+                    "request_id": f"server-followup-{uuid.uuid4().hex}",
+                    "db_id": session.db_id,
+                    "session_id": session.db_id,
+                    "runtime_session_id": session.id,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "follow-up run drain failed for session=%s", session.db_id,
+            )
+
+
 def _correlated_run_message(
     session: DaoSession, message: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2944,6 +3592,27 @@ async def _handle_explicit_run_message(
         owner = active_run_owner(session.db_id) if session.db_id else None
         if _session_run_active(session) or owner is not None:
             active = session.active_controller or getattr(owner, "active_controller", None)
+            # Wave5 E3: a turn submitted while a *genuinely live* run is in
+            # flight is not a duplicate — it is steering (act on it before the
+            # next LLM call) or a follow-up (act after the run settles).  A
+            # fail-closed admission barrier (provider never started) keeps the
+            # existing session_busy rejection so a stuck run is never silently
+            # queued behind.
+            if _run_genuinely_live(session, owner):
+                enqueued = _enqueue_mid_run_turn(
+                    session, content,
+                    steer=bool(message.get("steer")),
+                )
+                if enqueued is not None:
+                    await websocket.send_json({
+                        **_run_submission_context(
+                            session, request_id=request_id,
+                            requested_db_id=requested_db_id,
+                        ),
+                        "type": "run_queued", "mode": enqueued,
+                        "run_id": active.run_id if active is not None else None,
+                    })
+                    return True
             await websocket.send_json({
                 "type": "error", "code": "session_busy",
                 "message": "已有任务正在运行，请先停止或等待完成。",
@@ -3340,6 +4009,16 @@ def _run_settlement_callback(websocket: WebSocket, session: DaoSession):
                     "run settlement notification failed for runtime=%s",
                     runtime.id, exc_info=True,
                 )
+        # Wave5 E3: after ownership is clear, drain any follow-up turns queued
+        # while the run was live into fresh continuation runs.  A follow-up
+        # submitted mid-run must be acted on once the agent's work has fully
+        # settled, not dropped.  Best-effort and non-blocking on the notify.
+        try:
+            await _drain_followups(websocket, session)
+        except Exception:
+            logger.exception(
+                "follow-up drain failed for session=%s", session.db_id,
+            )
 
     return settled
 
