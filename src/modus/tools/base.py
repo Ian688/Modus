@@ -28,15 +28,40 @@ class ApprovalResponse:
     ``decision`` is one of approve/deny/skip/modify.  ``modified_input`` is
     required for modify: the exact replacement payload the executor will
     re-validate and re-hash before execution.  deny/skip may carry a ``reason``.
+
+    Grant-scoped fields (``remember`` / ``pattern``) are only ever advisory
+    hints from the human side of the approval surface.  The executor retains
+    the sole authority to persist a grant into the ``SessionGrantStore`` after
+    it has recomputed the resource key from the *effective* (possibly
+    user-modified) payload, so a remember can never out-scope the exact payload
+    that was approved.
     """
 
     decision: ToolDecision
     modified_input: dict[str, Any] | None = None
     reason: str = ""
+    # True when the human asked to remember this resource (per-resource
+    # session grant).  ``remember_pattern`` applies when the remember is a
+    # command-pattern rule (per-tool "remember the rule").
+    remember: bool = False
+    remember_pattern: str | None = None
 
     @classmethod
-    def approve(cls) -> "ApprovalResponse":
-        return cls("approve")
+    def approve(
+        cls,
+        *,
+        remember: bool = False,
+        remember_pattern: str | None = None,
+    ) -> "ApprovalResponse":
+        # A command-pattern rule is itself a remember intent: recording it IS
+        # remembering.  ``remember=True`` guarantees the executor persists it.
+        if remember_pattern:
+            remember = True
+        return cls(
+            "approve",
+            remember=remember,
+            remember_pattern=remember_pattern,
+        )
 
     @classmethod
     def deny(cls, reason: str = "") -> "ApprovalResponse":
@@ -47,8 +72,38 @@ class ApprovalResponse:
         return cls("skip", reason=reason)
 
     @classmethod
-    def modify(cls, modified_input: dict[str, Any]) -> "ApprovalResponse":
-        return cls("modify", modified_input=modified_input)
+    def modify(
+        cls,
+        modified_input: dict[str, Any],
+        *,
+        remember: bool = False,
+        remember_pattern: str | None = None,
+    ) -> "ApprovalResponse":
+        return cls(
+            "modify",
+            modified_input=modified_input,
+            remember=remember,
+            remember_pattern=remember_pattern,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """An ApprovalResponse compares equal to its plain decision string.
+
+        Legacy callers compare callback results to ``"approve"``/``"deny"``/
+        ``"skip"``; this keeps those comparisons working while still carrying
+        the optional reason / remember payloads.
+        """
+        if isinstance(other, str):
+            return self.decision == other
+        if isinstance(other, ApprovalResponse):
+            return (
+                self.decision == other.decision
+                and self.modified_input == other.modified_input
+                and self.reason == other.reason
+                and self.remember == other.remember
+                and self.remember_pattern == other.remember_pattern
+            )
+        return NotImplemented
 
 @dataclass(slots=True)
 class ToolResult:
@@ -79,6 +134,72 @@ class ToolResult:
     def model_text(self) -> str:
         """Return the canonical text this tool result reveals to the model."""
         return self.model_payload if self.model_payload else self.content
+
+    @classmethod
+    def denied(
+        cls,
+        tool_name: str,
+        reason: str = "",
+        *,
+        tool_use_id: str | None = None,
+        suggestions: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ToolResult":
+        """Structured denial result for A2 deny re-injection.
+
+        ``is_error=False``: a denial is information for the agent to change
+        course (cc-haha #1051 lesson), never a turn-aborting failure.  The
+        content is a self-contained block the model reads as a tool result.
+        """
+        lines = [
+            f"[Tool {tool_name} was NOT executed — approval denied by the user]",
+        ]
+        if reason:
+            lines.append(f"reason: {reason}")
+        if suggestions:
+            lines.append(f"suggestions: {'; '.join(suggestions)}")
+        meta = dict(metadata or {})
+        meta["operation"] = "approval-denied"
+        meta["approved"] = False
+        return cls(
+            content="\n".join(lines),
+            is_error=False,
+            display_summary=f"{tool_name} denied",
+            tool_use_id=tool_use_id,
+            metadata=meta,
+        )
+
+    @classmethod
+    def skipped(
+        cls,
+        tool_name: str,
+        reason: str = "",
+        *,
+        tool_use_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ToolResult":
+        """Fail-closed non-error skip result (A2).
+
+        A skip keeps today's semantics — the tool does not run and the run
+        continues as if the result were a no-op — but surfaces *why* to the
+        model instead of a bare bracket marker, so the agent is not tempted to
+        retry the identical call.
+        """
+        lines = [
+            f"[Tool skipped by user approval] {tool_name} was NOT executed",
+        ]
+        if reason:
+            lines.append(f"reason: {reason}")
+        meta = dict(metadata or {})
+        meta["operation"] = "skipped"
+        meta["approved"] = False
+        return cls(
+            content="\n".join(lines),
+            is_error=False,
+            display_summary=f"{tool_name} skipped",
+            tool_use_id=tool_use_id,
+            metadata=meta,
+        )
 
 @dataclass(slots=True)
 class ToolContext:
@@ -111,6 +232,11 @@ class ToolContext:
     # approval.  Empty list means "deny everything declared"; tools with no
     # declared capabilities are also denied under any explicit set.
     granted_capabilities: list[str] | None = None
+    # Session-scoped approval grant store (A1 scoped cache + A2 rule memory).
+    # ``None`` keeps today's behavior: every ASK goes to the callback and no
+    # per-resource reuse happens.  The executor lazily creates a store when a
+    # human explicitly asks to remember a resource.
+    grant_store: Any = None
 
 @dataclass(slots=True)
 class Tool:
@@ -132,6 +258,25 @@ class Tool:
     capabilities: tuple[CapabilityClass, ...] = ()
     timeout: float = 60.0
     required_keys: list[str] = field(default_factory=list)
+    # Optional resource-key extractor for scoped approval (A1).  When set, the
+    # executor scopes approvals to the returned key (e.g. a rewritten command,
+    # a URL origin, a target path).  ``None`` means the tool has no finer
+    # resource scope and keeps per-tool semantics.
+    permission_hint: Callable[[dict[str, Any]], str | None] | None = None
+
+    def resource_key(self, payload: dict[str, Any]) -> str | None:
+        """Return this tool's approval resource key for a validated payload.
+
+        ``None`` (no hint, or the hint itself returned None) means the approval
+        is not resource-scoped: it stays per-tool.
+        """
+        if self.permission_hint is None:
+            return None
+        try:
+            key = self.permission_hint(payload)
+        except Exception:
+            return None
+        return key if isinstance(key, str) and key else None
 
     def definition(self) -> dict[str, Any]:
         return {

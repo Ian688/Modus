@@ -208,6 +208,7 @@ class ReActReasoner:
             granted_capabilities=(
                 getattr(getattr(self.config, "policy", None), "capability_grant", None)
             ),
+            grant_store=_grant_store(self.session_id),
         )
 
         terminal_reason = StopReason.MAX_TURNS
@@ -463,3 +464,33 @@ def _classify_failover_reason(detail: str) -> str:
         except (ValueError, IndexError):
             status = 0
     return classify_api_error(RuntimeError(detail), status).reason.value
+
+
+# Process-wide per-session approval grant stores (Wave-3 A1/A2).
+# Keyed by session_id so concurrent sub-sessions never share grants; a session
+# without an id (plain CLI) shares the "default" store for the process.
+_GRANT_STORES: dict[str, Any] = {}
+_GRANT_LOCK: Any = None
+
+
+def _grant_store(session_id: str | None) -> Any:
+    """Return the SessionGrantStore for a session (creating it lazily).
+
+    The store holds the A1 scoped approval grants and A2 rule memory for one
+    session.  It is injected into every ToolContext the agent loop builds so
+    the executor can consult it before asking the human.
+    """
+    from modus.policy.approval import SessionGrantStore
+
+    global _GRANT_LOCK
+    if _GRANT_LOCK is None:
+        import threading
+
+        _GRANT_LOCK = threading.Lock()
+    key = str(session_id or "default")
+    with _GRANT_LOCK:
+        store = _GRANT_STORES.get(key)
+        if store is None:
+            store = SessionGrantStore()
+            _GRANT_STORES[key] = store
+        return store

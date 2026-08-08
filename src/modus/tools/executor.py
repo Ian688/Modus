@@ -7,6 +7,7 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from modus.tools.base import Tool, ToolContext, ToolDecision, ToolResult
 from modus.tools.registry import ToolRegistry
@@ -105,14 +106,35 @@ class ToolExecutor:
                 )
             decision = await self._approval_decision(tool, data, context, tool_call_id)
             if decision.is_denied:
-                return ToolResult(tool_use_id=tool_call_id, content=decision.error, is_error=True)
-            if decision.is_skipped:
-                # A skip is a fail-closed non-error: the tool does not run, but
-                # the run continues as if the tool result were a no-op.
+                # A2 deny re-injection (cc-haha #1051 lesson): a denial is not
+                # an abort.  When a human denied, the model receives a
+                # structured, non-error tool result so it sees the denial and
+                # can change course instead of blindly retrying the same call.
+                # Infrastructure/policy denials remain genuine errors.
+                if decision.human:
+                    return ToolResult.denied(
+                        tool.name,
+                        reason=decision.reason,
+                        tool_use_id=tool_call_id,
+                        suggestions=[
+                            "modify the tool arguments and retry",
+                            "use a different approach",
+                            "request the needed permission",
+                        ],
+                    )
                 return ToolResult(
                     tool_use_id=tool_call_id,
-                    content="[Tool skipped by user approval]",
-                    metadata={"operation": "skipped"},
+                    content=decision.error,
+                    is_error=True,
+                )
+            if decision.is_skipped:
+                # A skip is a fail-closed non-error: the tool does not run, but
+                # the run continues as if the tool result were a no-op.  It now
+                # tells the model *why* instead of a bare bracket marker.
+                return ToolResult.skipped(
+                    tool.name,
+                    reason=decision.reason,
+                    tool_use_id=tool_call_id,
                 )
             # ``decision.payload`` is the (possibly user-modified) payload the
             # human approved.  It is re-validated before execution below.
@@ -143,6 +165,16 @@ class ToolExecutor:
                 context._snapshot_taken = True
             result = await tool.execute(effective_payload, context)
             result.tool_use_id = tool_call_id
+            # A1/A2 grant recording.  Only the executor converts an advisory
+            # "remember this" hint from the approval surface into a grant in the
+            # session store, and only after the human approved the exact payload
+            # that will be executed (for ``modify``, the re-validated edited
+            # payload).  A per-resource remember never records an invocation
+            # with no resource scope.
+            if decision.remember or decision.remember_pattern:
+                self._record_remember(
+                    tool, effective_payload, decision, context, tool_call_id,
+                )
             return result
         except Exception as exc:
             return ToolResult(
@@ -150,6 +182,41 @@ class ToolExecutor:
                 content=f'Tool "{name}" execution error: {exc}',
                 is_error=True,
             )
+
+    def _record_remember(
+        self,
+        tool: Tool,
+        effective_payload: dict[str, Any],
+        decision: _ApprovalDecision,
+        context: ToolContext,
+        tool_call_id: str,
+    ) -> None:
+        """Persist a human "remember this" into the session grant store.
+
+        ``modify`` records under the resource key of the *effective* payload
+        the human approved, so a remember applies to the rewritten resource
+        (A1 step 4: ``m`` records with the modified payload's resource_key).
+        A ``remember_pattern`` writes an A2 command rule.  Fail-open on store
+        absence (an embedder that never wired a store just skips the remember).
+        """
+        try:
+            from modus.policy.approval import SessionGrantStore
+
+            store = getattr(context, "grant_store", None)
+            if not isinstance(store, SessionGrantStore):
+                return
+            pattern = decision.remember_pattern
+            if pattern:
+                store.add_rule(tool.name, pattern, "approve")
+                return
+            # ``remember_key`` is precomputed from the exact (possibly edited)
+            # payload that was approved; fall back to recomputing for safety.
+            key = decision.remember_key or _effective_resource_key(tool, effective_payload)
+            if key:
+                store.record_grant(tool.name, key, "approve")
+        except Exception:
+            # Remembering is advisory; never let it break the executed tool.
+            return
 
     def _capture_pre_turn_snapshot(self, context: ToolContext) -> None:
         """Best-effort side-git snapshot before a run's first mutation.
@@ -184,14 +251,26 @@ class ToolExecutor:
         transport error denies execution.  ``modify`` returns the replacement
         payload to execute (re-validated by the caller); ``skip`` signals a
         no-op non-error.
+
+        A1 scoping: ``resource_key`` scopes the approval to a concrete
+        resource (rewritten command, URL origin, target path).  A remembered
+        session grant for the same ``(tool, resource_key)`` is reused instead
+        of re-asking.  A persisted rule (A2) may auto-allow or auto-deny a
+        matching resource before the callback is ever consulted.
         """
         from modus.policy.approval import ApprovalDecision, ApprovalPolicy
 
-        decision = ApprovalPolicy(context.config.policy).evaluate(tool)
+        grant_store = getattr(context, "grant_store", None)
+        resource_key = _effective_resource_key(tool, payload)
+
+        policy = ApprovalPolicy(context.config.policy)
+        decision = policy.scoped_decision(tool, resource_key, grant_store)
         if decision is ApprovalDecision.ALLOW:
             return _ApprovalDecision.allowed()
         if decision is ApprovalDecision.DENY:
-            return _ApprovalDecision.denied(f'Tool "{tool.name}" denied by approval policy.')
+            return _ApprovalDecision.denied(
+                f'Tool "{tool.name}" denied by approval policy.'
+            )
         if context.approval_callback is None:
             return _ApprovalDecision.denied(
                 f'Tool "{tool.name}" requires approval, but no approval callback is available.'
@@ -217,6 +296,8 @@ class ToolExecutor:
             # context for the human reviewer; enforcement stays in the guards.
             "impact_class": _impact_class(tool),
         }
+        if resource_key:
+            request["resource_key"] = resource_key
         try:
             response = context.approval_callback(request)
             if inspect.isawaitable(response):
@@ -226,7 +307,7 @@ class ToolExecutor:
                 f'Tool "{tool.name}" approval failed closed: {exc}'
             )
 
-        decision_str, modified_input, reason = _parse_approval_response(
+        decision_str, modified_input, reason, remember, remember_pattern = _parse_approval_response(
             response, tool, payload,
         )
         if decision_str == "modify":
@@ -244,7 +325,13 @@ class ToolExecutor:
                 return _ApprovalDecision.denied(
                     f'Tool "{tool.name}" approval modify failed closed: input instability.'
                 )
-            return _ApprovalDecision.modified(modified_input)
+            remember_key = _effective_resource_key(tool, modified_input)
+            return _ApprovalDecision.modified(
+                modified_input,
+                remember=remember,
+                remember_key=remember_key,
+                remember_pattern=remember_pattern,
+            )
         if decision_str == "approve":
             if time.time() >= expires_at:
                 return _ApprovalDecision.denied(f'Tool "{tool.name}" approval expired.')
@@ -255,37 +342,88 @@ class ToolExecutor:
                 return _ApprovalDecision.denied(
                     f'Tool "{tool.name}" approval denied: input changed after approval request.'
                 )
-            return _ApprovalDecision.allowed()
+            return _ApprovalDecision.allowed(
+                remember=remember,
+                remember_key=resource_key,
+                remember_pattern=remember_pattern,
+            )
         if decision_str == "skip":
             return _ApprovalDecision.skipped(reason or "")
-        return _ApprovalDecision.denied(f'Tool "{tool.name}" approval denied.')
+        # A plain deny (or unrecognized decision) from the callback is a human
+        # decision: fail closed, but report it to the model as information.
+        return _ApprovalDecision.human_denied(reason or "")
 
 
 @dataclass(slots=True)
 class _ApprovalDecision:
-    """Internal approval outcome: allowed / denied / skipped / modified."""
+    """Internal approval outcome: allowed / denied / skipped / modified.
+
+    ``remember`` / ``remember_key`` / ``remember_pattern`` carry the A1/A2
+    persistence intent from the human approval surface to the executor, which
+    is the only component allowed to write into the ``SessionGrantStore``.
+
+    ``human`` distinguishes a denial the *human* made (A2: re-inject as a
+    non-error tool result so the agent sees it and changes course) from an
+    infrastructure/policy/integrity denial (no callback, policy block, expiry,
+    hash mismatch — a genuine failure, reported as an error).
+    """
 
     allow: bool = False
     deny: bool = False
     skip: bool = False
+    human: bool = False
     payload: dict[str, Any] | None = None
     error: str = ""
+    reason: str = ""
+    remember: bool = False
+    remember_key: str | None = None
+    remember_pattern: str | None = None
 
     @classmethod
-    def allowed(cls) -> "_ApprovalDecision":
-        return cls(allow=True)
+    def allowed(
+        cls,
+        *,
+        remember: bool = False,
+        remember_key: str | None = None,
+        remember_pattern: str | None = None,
+    ) -> "_ApprovalDecision":
+        return cls(
+            allow=True,
+            remember=remember,
+            remember_key=remember_key,
+            remember_pattern=remember_pattern,
+        )
 
     @classmethod
-    def denied(cls, error: str) -> "_ApprovalDecision":
-        return cls(deny=True, error=error)
+    def denied(cls, error: str, reason: str = "") -> "_ApprovalDecision":
+        """Infrastructure / policy / integrity denial (reported as an error)."""
+        return cls(deny=True, error=error, reason=reason)
+
+    @classmethod
+    def human_denied(cls, reason: str = "") -> "_ApprovalDecision":
+        """Human denial — re-injected to the model as a non-error (A2)."""
+        return cls(deny=True, human=True, error=f"denied by user approval", reason=reason)
 
     @classmethod
     def skipped(cls, reason: str = "") -> "_ApprovalDecision":
-        return cls(skip=True, error=reason)
+        return cls(skip=True, error=reason, reason=reason)
 
     @classmethod
-    def modified(cls, payload: dict[str, Any]) -> "_ApprovalDecision":
-        return cls(allow=True, payload=payload)
+    def modified(
+        cls,
+        payload: dict[str, Any],
+        *,
+        remember: bool = False,
+        remember_key: str | None = None,
+        remember_pattern: str | None = None,
+    ) -> "_ApprovalDecision":
+        return cls(
+            allow=True,
+            payload=payload,
+            remember=remember,
+            remember_key=remember_key,
+            remember_pattern=remember_pattern,
+        )
 
     @property
     def is_allowed(self) -> bool:
@@ -317,41 +455,117 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+# ── A1 resource-key helpers ────────────────────────────────────────────────
+#
+# The design doc wires ``permission_hint`` on the shared builtin Tool
+# declarations (tools/builtins.py).  Until that lands, the executor drives the
+# same scoping from tool metadata via ``_default_permission_hint``, so scoped
+# approval works for the flagged tools today and the hints are simply migrated
+# onto the Tool objects later.
+
+
+def _effective_resource_key(tool: Tool, payload: dict[str, Any]) -> str | None:
+    """Resource key for a user-*modified* payload (``m`` decision).
+
+    Prefers an explicit ``permission_hint`` when the Tool has one; otherwise
+    falls back to the metadata-driven default extractor so a modified command
+    is remembered under its rewritten resource, not the original one.
+    """
+    return tool.resource_key(payload) or _default_resource_key(tool, payload)
+
+
+def _default_permission_hint(tool: Tool) -> str | None:
+    """Best-effort default resource scope for tools without a permission_hint.
+
+    Mirrors the metadata the builtins already declare: command-based exec tools
+    scope by the rewritten command, fetch tools by URL origin, path tools by
+    target path, git fetch/pull/push by the remote name.  Returns None for
+    anything it cannot classify confidently — None means "no finer scope,
+    stays per-tool".
+    """
+    name = tool.name
+    if name in {"bash", "run_tests"}:
+        return "command"
+    if name in {"web_fetch", "browser_navigate"}:
+        return "origin"
+    if name in {"git_fetch", "git_pull", "git_push"}:
+        return "remote"
+    if name in {"write_file", "edit_file", "office_exec"}:
+        return "path"
+    return None
+
+
+def _default_resource_key(tool: Tool, payload: dict[str, Any]) -> str | None:
+    """Extract a resource key from a payload for the flagged builtins.
+
+    ``command`` tools use the rewritten command (approving ``cat a`` never
+    reuses for ``rm -rf``).  Fetch tools use the URL origin (approving one host
+    never reuses for an intranet address).  Git write tools use the remote
+    name.  Path tools use the resolved target path.
+    """
+    kind = _default_permission_hint(tool)
+    if kind == "command":
+        command = str(payload.get("command") or "").strip()
+        return command or None
+    if kind == "remote":
+        remote = str(payload.get("remote") or "").strip()
+        return remote or None
+    if kind == "origin":
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return None
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return url
+        netloc = parsed.netloc or parsed.path
+        return netloc or url
+    if kind == "path":
+        path = str(payload.get("path") or payload.get("file_path") or "").strip()
+        return path or None
+    return None
+
+
 def _parse_approval_response(
     response: Any,
     tool: Any,
     original_payload: dict[str, Any],
-) -> tuple[str, dict[str, Any] | None, str]:
-    """Normalize a callback response into (decision, modified_input, reason).
+) -> tuple[str, dict[str, Any] | None, str, bool, str | None]:
+    """Normalize a callback response into (decision, modified_input, reason,
+    remember, remember_pattern).
 
     Accepts the legacy plain string (``approve``/``allow``/``deny``) and the
     structured ``ApprovalResponse`` (approve/deny/skip/modify).  Anything else
     is treated as deny (fail closed).  ``modify`` carries the replacement
     payload as-is; the executor re-validates and re-hashes it before running.
+    ``remember`` / ``remember_pattern`` are advisory hints from the human
+    surface; only the executor may convert them into grants.
     """
     from modus.tools.base import ApprovalResponse
 
     if isinstance(response, ApprovalResponse):
         decision = str(response.decision or "").lower()
+        remember = bool(response.remember)
+        remember_pattern = response.remember_pattern or None
         if decision == "approve":
-            return "approve", None, ""
+            return "approve", None, "", remember, remember_pattern
         if decision == "modify":
             modified = response.modified_input
             if not isinstance(modified, dict) or not modified:
-                return "deny", None, ""
-            return "modify", dict(modified), str(response.reason or "")
+                return "deny", None, "", False, None
+            return "modify", dict(modified), str(response.reason or ""), remember, remember_pattern
         if decision == "skip":
-            return "skip", None, str(response.reason or "")
+            return "skip", None, str(response.reason or ""), False, None
         # deny and everything else
-        return "deny", None, str(response.reason or "")
+        return "deny", None, str(response.reason or ""), False, None
     if isinstance(response, str):
         normalized = response.strip().lower()
         if normalized in {"approve", "allow"}:
-            return "approve", None, ""
+            return "approve", None, "", False, None
         if normalized in {"skip", "skipped"}:
-            return "skip", None, ""
-        return "deny", None, ""
-    return "deny", None, ""
+            return "skip", None, "", False, None
+        return "deny", None, "", False, None
+    return "deny", None, "", False, None
 
 def _tool_call_name(call: dict[str, Any]) -> str:
     function = call.get("function") if isinstance(call.get("function"), dict) else {}

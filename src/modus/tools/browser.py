@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from typing import Any
 
 from modus.tools.base import ToolContext, ToolResult
+
+logger = logging.getLogger(__name__)
 
 # A blocklist of exfiltration APIs for browser_eval, applied as a first line.
 # The approval gate is authoritative; this is belt-and-suspenders for the case
@@ -47,44 +50,81 @@ _browser_lock = asyncio.Lock()
 _holder: dict[str, Any] | None = None  # {"pw","browser","context","page"}
 
 
+async def _page_alive(page: Any) -> bool:
+    """Best-effort liveness probe for the shared page.
+
+    ``page.is_closed()`` is cheap and covers an explicit close.  A crashed
+    renderer surfaces as an error or closed page on the next protocol call, so
+    we additionally probe ``page.url`` (a round-trip through the transport)
+    and treat any error as "not alive" so the caller recycles the browser.
+    """
+    try:
+        if page.is_closed():
+            return False
+        await page.title()  # round-trip: raises if the transport/crashed process is gone
+        return True
+    except Exception:
+        return False
+
+
+async def _launch_browser() -> dict[str, Any]:
+    """Launch a fresh playwright browser context and return its holder dict."""
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "playwright 未安装：请运行 `pip install -e '.[dev]'` 或 `uv sync --group dev`"
+        ) from exc
+    pw = await async_playwright().start()
+    try:
+        browser = await pw.chromium.launch(channel="chrome", headless=True)
+    except Exception:
+        # System Chrome missing; fall back to playwright's bundled chromium.
+        browser = await pw.chromium.launch(headless=True)
+    context = await browser.new_context(viewport={"width": 1280, "height": 800})
+    page = await context.new_page()
+    return {"pw": pw, "browser": browser, "context": context, "page": page}
+
+
 async def _ensure_browser() -> Any:
-    """Return the shared Page, launching headless Chrome on first use."""
+    """Return the shared Page, launching headless Chrome on first use.
+
+    If a previously launched page was closed (tool-level ``browser_close``) or
+    its renderer process crashed, the holder is recycled and a fresh browser is
+    launched so the next tool call never operates on a dead page.
+    """
     global _holder
     async with _browser_lock:
-        if _holder is not None:
+        if _holder is not None and await _page_alive(_holder["page"]):
             return _holder["page"]
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            raise RuntimeError(
-                "playwright 未安装：请运行 `pip install -e '.[dev]'` 或 `uv sync --group dev`"
-            ) from exc
-        pw = await async_playwright().start()
-        try:
-            browser = await pw.chromium.launch(channel="chrome", headless=True)
-        except Exception:
-            # System Chrome missing; fall back to playwright's bundled chromium.
-            browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1280, "height": 800})
-        page = await context.new_page()
-        _holder = {"pw": pw, "browser": browser, "context": context, "page": page}
-        return page
+        if _holder is not None:
+            # Stale page: tear down and relaunch instead of reusing a corpse.
+            logger.warning("browser page dead; recycling shared browser")
+            await _close_browser_locked()
+        _holder = await _launch_browser()
+        return _holder["page"]
+
+
+async def _close_browser_locked() -> None:
+    """Tear down the shared browser.  Caller must hold ``_browser_lock``."""
+    global _holder
+    if _holder is None:
+        return
+    try:
+        await _holder["browser"].close()
+    except Exception:
+        pass
+    try:
+        await _holder["pw"].stop()
+    except Exception:
+        pass
+    _holder = None
 
 
 async def _close_browser() -> None:
     global _holder
     async with _browser_lock:
-        if _holder is None:
-            return
-        try:
-            await _holder["browser"].close()
-        except Exception:
-            pass
-        try:
-            await _holder["pw"].stop()
-        except Exception:
-            pass
-        _holder = None
+        await _close_browser_locked()
 
 
 def _bound_eval_source(js: str) -> None:

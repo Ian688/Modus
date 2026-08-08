@@ -116,6 +116,49 @@ class ConvergenceConfig:
     max_recursion_depth: int = 0
 
 @dataclass(slots=True)
+class WorkerConfig:
+    """Concurrency worker layer (Wave 0): heavy work runs in isolated
+    processes with a memory cap, so Excel analysis / system tuning / coding
+    can run in parallel without starving each other or the main process.
+
+    The worker boundary is a process + a JSON protocol (never FFI), so any
+    worker implementation can later be replaced by a faster one (e.g. Rust)
+    without touching the callers.
+    """
+    enabled: bool = False
+    max_concurrency: int = 4
+    office_memory_limit: int = 1_024 * 1_024 * 1_024  # 1 GiB default
+    tick_interval: float = 5.0
+    memory_warn_ratio: float = 0.9  # warn when a worker's RSS exceeds this × cap
+
+
+@dataclass(slots=True)
+class StorageConfig:
+    """Retention / quota / integrity governance for Modus's own data plane.
+
+    Conservative and reversible by default: ``prune_expired`` (desktop/db.py)
+    only reports candidates unless ``enable_prune`` is explicitly enabled.
+    Every policy below is bounded to Modus's private data directory — user
+    files are never candidates.
+    """
+    # Audit log rotation: split once the active audit.jsonl exceeds this many
+    # bytes, keep ``audit_rotate_keep`` rolled copies (audit-1.jsonl … N).
+    audit_rotate_bytes: int = 100 * 1024 * 1024  # 100 MiB
+    audit_rotate_keep: int = 5
+    # run_events rows older than this many days are prune candidates.
+    run_events_retain_days: int = 90
+    # memories older than this are soft-expired (status -> archived), never deleted.
+    memories_soft_expire_days: int = 365
+    # artifact ledger caps: total stored bytes and total row count.
+    artifacts_max_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GiB
+    artifacts_max_count: int = 10_000
+    # Side-git snapshots kept per project; older ones are dropped when over limit.
+    snapshot_retain_per_run: int = 50
+    # Master switch: pruning only reports candidates until this is True.
+    enable_prune: bool = False
+
+
+@dataclass(slots=True)
 class RuntimeConfig:
     max_turns: int = 20
     max_tokens: int = 200_000
@@ -124,6 +167,10 @@ class RuntimeConfig:
     # Self-aware stall detection: stop when this many consecutive turns made
     # no progress (no text, no successful tool). 0 disables the check.
     no_progress_threshold: int = 4
+    # Unattended approval gate: an unanswered run approval auto-denies after
+    # this many seconds so a run can never hang forever waiting on a human.
+    approval_timeout_seconds: float = 600.0
+    worker: WorkerConfig = field(default_factory=WorkerConfig)
 
 @dataclass(slots=True)
 class FeatureConfig:
@@ -155,6 +202,7 @@ class ModusConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     moa: MoaConfig = field(default_factory=MoaConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
 
 # 配置系统的灵魂——load_config() 函数
 
@@ -230,6 +278,7 @@ def _dict_to_config(data: dict[str, Any]) -> ModusConfig:
         features=FeatureConfig(**feature_data),
         moa=MoaConfig(**data.get("moa", {})),
         runtime=RuntimeConfig(**data.get("runtime", {})),
+        storage=StorageConfig(**data.get("storage", {})),
     )
 
 # 最重要的函数——load_config() 主逻辑：
@@ -325,6 +374,15 @@ def _apply_env(data: dict[str, Any], env: dict[str, str | None]) -> dict[str, An
         ("RUN_MAX_WALL_SECONDS", "runtime.max_wall_seconds", float),
         ("RUN_MAX_VERIFICATION_ATTEMPTS", "runtime.max_verification_attempts", int),
         ("RUN_NO_PROGRESS_THRESHOLD", "runtime.no_progress_threshold", int),
+        ("APPROVAL_TIMEOUT", "runtime.approval_timeout_seconds", float),
+        ("STORAGE_AUDIT_ROTATE_BYTES", "storage.audit_rotate_bytes", int),
+        ("STORAGE_AUDIT_ROTATE_KEEP", "storage.audit_rotate_keep", int),
+        ("STORAGE_RUN_EVENTS_RETAIN_DAYS", "storage.run_events_retain_days", int),
+        ("STORAGE_MEMORIES_SOFT_EXPIRE_DAYS", "storage.memories_soft_expire_days", int),
+        ("STORAGE_ARTIFACTS_MAX_BYTES", "storage.artifacts_max_bytes", int),
+        ("STORAGE_ARTIFACTS_MAX_COUNT", "storage.artifacts_max_count", int),
+        ("STORAGE_SNAPSHOT_RETAIN_PER_RUN", "storage.snapshot_retain_per_run", int),
+        ("STORAGE_ENABLE_PRUNE", "storage.enable_prune", lambda v: v.lower() == "true"),
     ]
 
     for suffix, config_path, caster in mappings:

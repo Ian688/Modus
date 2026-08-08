@@ -72,7 +72,9 @@ async def test_high_risk_tool_denied_by_callback_never_executes():
     result = (await _executor(tool).execute_all([_call()], _context(deny)))[0]
 
     assert executed is False
-    assert result.is_error is True
+    # Wave-3 A2: a human deny is INFORMATION, not an error — the model must see
+    # the refusal and redirect, so the tool result carries it as a non-error.
+    assert result.is_error is False
     assert "denied" in result.content.lower()
 
 

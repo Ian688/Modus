@@ -183,9 +183,16 @@ def _reject_dangerous_imports(script: str) -> str | None:
 
 
 async def office_exec(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    """Run a sandboxed Python script that reads/writes one Office file."""
+    """Run a sandboxed Python script that reads/writes one Office file.
+
+    ``worker: true`` runs the script through the Wave-0 WorkerPool — an
+    isolated worker process with a memory cap — so several heavy Office jobs
+    can run in parallel without starving the main process.  Default (no
+    ``worker`` key) preserves the previous synchronous behavior.
+    """
     path_value = str(payload.get("path") or "").strip()
     script = str(payload.get("script") or "").strip()
+    use_worker = bool(payload.get("worker") or False)
     if not path_value:
         return ToolResult("office_exec requires a path", is_error=True)
     if not script:
@@ -208,6 +215,13 @@ async def office_exec(payload: dict[str, Any], context: ToolContext) -> ToolResu
         return ToolResult(f"office_exec rejected: {import_error}", is_error=True)
 
     is_write = _looks_like_write(script)
+    if use_worker:
+        return await _run_script_worker(target, script, is_write)
+    return await _run_script_direct(target, script, is_write)
+
+
+async def _run_script_direct(target: Path, script: str, is_write: bool) -> ToolResult:
+    """Synchronous-path execution (unchanged behavior)."""
     try:
         proc = _run_script(target, script)
         out = (proc.stdout or "") + (("\n" + proc.stderr.strip()) if proc.stderr.strip() else "")
@@ -217,7 +231,7 @@ async def office_exec(payload: dict[str, Any], context: ToolContext) -> ToolResu
             out = f"(exit code {proc.returncode})\n" + out
             return ToolResult(
                 out.strip()[: _MAX_OUTPUT_CHARS] or f"(exit code {proc.returncode})",
-                display_summary=f"Office 脚本失败：{path_value}",
+                display_summary=f"Office 脚本失败：{target}",
                 metadata={"operation": "office_exec", "path": str(target),
                           "write": is_write, "exit_code": proc.returncode},
                 is_error=True,
@@ -227,14 +241,94 @@ async def office_exec(payload: dict[str, Any], context: ToolContext) -> ToolResu
     except Exception as exc:
         return ToolResult(f"office_exec failed: {exc}", is_error=True)
 
+    return _office_result(target, out, is_write)
+
+
+async def _run_script_worker(target: Path, script: str, is_write: bool) -> ToolResult:
+    """Wave-0 worker path: run in an isolated, memory-capped worker process."""
+    from modus.runtime.workers import WorkerPool, _worker_pool_for
+
+    pool = _worker_pool_for()
+    if pool is None or not pool.config.enabled:
+        # Worker layer not enabled (config/runtime) — fall back to direct.
+        return await _run_script_direct(target, script, is_write)
+
+    code = _build_worker_code(target, script)
+    wid = await pool.submit(
+        "office", [sys.executable, "-c", code],
+        memory_limit=pool.config.office_memory_limit,
+    )
+    try:
+        state = await pool.wait(wid, timeout=_TIMEOUT)
+    except asyncio.TimeoutError:
+        await pool.cancel(wid)
+        return ToolResult(f"office_exec timed out after {_TIMEOUT:.0f}s", is_error=True)
+
+    if state["status"] == "cancelled":
+        return ToolResult("office_exec cancelled", is_error=True)
+    if state["status"] == "failed":
+        # OOM kill (-9) vs natural failure (exit != 0).
+        code_out = state.get("exit_code")
+        if code_out == -9:
+            return ToolResult(
+                f"office_exec worker exceeded its memory cap and was killed",
+                display_summary=f"Office 脚本内存超限：{target}",
+                metadata={"operation": "office_exec", "path": str(target),
+                          "write": is_write, "exit_code": -9},
+                is_error=True,
+            )
+        out = _read_worker_output(state, target)
+        return ToolResult(
+            out.strip()[: _MAX_OUTPUT_CHARS] or f"(exit code {code_out})",
+            display_summary=f"Office 脚本失败：{target}",
+            metadata={"operation": "office_exec", "path": str(target),
+                      "write": is_write, "exit_code": code_out},
+            is_error=True,
+        )
+
+    out = _read_worker_output(state, target)
+    return _office_result(target, out, is_write)
+
+
+def _office_result(target: Path, out: str, is_write: bool) -> ToolResult:
     bounded = out[:_MAX_OUTPUT_CHARS]
     if len(out) > _MAX_OUTPUT_CHARS:
         bounded += f"\n… [{len(out) - _MAX_OUTPUT_CHARS} chars omitted]"
     return ToolResult(
         bounded if bounded.strip() else "(no output)",
-        display_summary=f"Office 脚本：{path_value}",
+        display_summary=f"Office 脚本：{target}",
         metadata={
             "operation": "office_exec", "path": str(target),
             "write": is_write, "output_chars": len(out),
         },
     )
+
+
+def _build_worker_code(target: Path, script: str) -> str:
+    """Wrap the user script so it resolves ABS_PATH and prints stdout."""
+    import textwrap
+
+    return (
+        "import os\n"
+        f"ABS_PATH = {str(target)!r}\n"
+        "PATH = ABS_PATH\n"
+        + textwrap.indent(script, "")
+        + "\n"
+    )
+
+
+def _read_worker_output(state: dict, target: Path) -> str:
+    """Read a worker's stdout log, best-effort."""
+    out_path = (state.get("output") or {}).get("stdout")
+    try:
+        if out_path and Path(out_path).exists():
+            data = Path(out_path).read_text(encoding="utf-8", errors="replace")
+            stderr_path = (state.get("output") or {}).get("stderr")
+            if stderr_path and Path(stderr_path).exists():
+                err = Path(stderr_path).read_text(encoding="utf-8", errors="replace")
+                if err.strip():
+                    data = data + ("\n" + err.strip())
+            return data
+    except OSError:
+        pass
+    return f"(exit code {state.get('exit_code')})"

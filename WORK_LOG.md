@@ -671,3 +671,71 @@ Phase 0 是蓝图中最小、解锁后续一切的落地。
 
 建议执行顺序：Wave1 T1→T2→T3 → Wave3 A1→A2 → Wave2 C1 → Wave1 T4 → Wave2 C2/C3 → Wave4 G1/G2 → Wave3 A3 → Wave5 E1。
 全部未实施，等用户验收后按顺序开工。
+
+## Wave0 并发重活架构层（2026-08-08）
+
+用户从纯用户视角提出硬要求：打开 Modus 时所有渲染快速美观、点击丝滑、能同时干很多重活（Excel 分析+系统优化+coding+Chrome preview 并行）、内存管理优秀到用户不抱怨"又把内存吃完了"。
+
+结论（多轮讨论修正）：
+- 用户三条要求里，"同时干重活 + 内存不抱怨"是 Python 的语言层劣势（GIL 限并行、GC 不保证及时回收、碎片不还 OS）——这是架构补不全的，最终要 Rust 下沉。
+- 但"现在换语言"是错的：还没造出"同时跑 N 个重活"场景，改写无可测负载。正确路径 = 先搭"并发重活架构层"（多进程 worker 隔离 + 内存有界回收），它既是现在 Python 的出路，也是未来 Rust 下沉的边界。
+- 语言策略修正：坚持 Python，但只坚持到"并发重活架构层"建立为止。之后每个 worker 实现语言按实测决定（测到内存/性能不过关才下沉 Rust，走 MCP 边界）。边界必须是协议（MCP/JSON），不是 FFI——FFI 传染 GIL/崩了拖垮主进程。
+
+产出：docs/dev-wave0-concurrency.md（W0-1 多进程 worker 隔离+内存上限 / W0-2 office_exec 下沉 / W0-3 事件订阅+Tick 节拍 / W0-4 Rust 下沉边界契约）。已并入 dev-index.md 总路线（Wave0 放最前）。
+
+12 项目进程实践确认：supervisor（状态机/事件监听/捕获标记/周期节拍）和 hermes（子进程 RPC/后台 fork/OS 隔离声明）是最强参考；loop（跨进程锁）/beads（文件事件总线）/peri（idle 唤醒）各补一块；AssetOpsBench（每次新 MCP 子进程无连接池）是反模式；pi 无权限系统是反例。
+
+建议：W0-1 + Wave1 T1（进程出身校验）一起做——都动进程层，避免两次改同一文件。
+
+## Wave0 W0-1 + Wave1 T1 落代码（2026-08-08）
+
+**W0-1 多进程 worker 隔离层**（`runtime/workers.py` 新增，~380 行）：
+- Worker/WorkerPool：独立进程 + 内存上限 + 并发队列 + 回收；`submit/cancel/wait/list/status/drain_events`
+- 内存硬上限：watchdog RSS 采样超限即 kill（跨平台可靠）；Linux 额外 RLIMIT_AS 硬边界（preexec）
+- macOS 坑已解决：RLIMIT_AS soft==hard → 需先抬 hard 再降 soft；且 macOS vsz 巨大使 AS 限制不可用，主机制定为 RSS watchdog
+- 事件流：worker_queued/started/completed/failed/cancelled/oom/memory_warn
+- `_worker_pool_for()` 进程级单例，config `runtime.worker`（enabled 默认 False，向后兼容）
+- `office_exec` 支持 `worker: true` → 走 WorkerPool（默认同步路径不变）；`_run_script_worker/_build_worker_code/_read_worker_output`
+- WS `worker_pool` command：桌面可见 worker 状态（enabled/workers/events）
+- 测试：test_workers.py 8 + office worker 2 + WS 1
+
+**Wave1 T1 进程出身校验**（`tools/process_tools.py` + `process_cleanup.py`）：
+- `_read_born_at(pid)`：Linux /proc/stat btime+starttime；macOS/BSD `ps -o lstart=`（macOS strptime 不支持 %e，用 %d 兼容空间填充）
+- `_pid_identity_ok(meta)`：pid 存活 + born_at 匹配（允许 <1s 偏差）；legacy 无 born_at 向后兼容
+- `spawn_process` 记录 born_at；`_process_status` 加 pid_reused 状态
+- `kill_process`：pid 被复用 → 拒绝 SIGKILL 无辜进程，标 pid_reused
+- `process_cleanup.py`：正常退出清理也走 identity 校验，防误杀
+- 测试：test_process_tools.py +5
+
+**验证**：全量 **1190 passed, 1 skipped**（基线 1165 → +25）。六条安全不变量不回退（审批门未动、capability 门未动）。
+
+## 并行开发三 stream（2026-08-08）——3 agent 同时开发
+
+**方法**：按文件独占分区并行（3 个 agent 各改不重叠文件），我作协调者合并验证。冲突点预先设计：executor 只 C 动、audit_log 只 A 动、builtins 共享区没人动。
+
+### Stream A 韧性（T2 数据治理 + T3 审批超时+watchdog）
+- StorageConfig（audit 轮转 100MB/保留 5 份；run_events 90 天；memories 软过期 365 天；artifacts 上限；enable_prune 默认关）
+- audit_log 写失败降级内存 ring；db quick_check 损坏恢复+备份+run 台账重建；WAL checkpoint
+- RunApprovalBroker 审批超时（默认 600s）→ deny + 审计；default_runner 也包 wait_for
+- browser 自动 relaunch；snapshot 按 run 保留 50 份
+- 新 `health.py` Watchdog（60s 周期，动作表 PRUNE/RECYCLE/DENY_STALE/NOTIFY，全进审计）
+- 测试：test_storage_governance(13) + test_approval_timeout(6) + test_health_watchdog(7) + browser(+3)
+
+### Stream B 上下文（C1 prompt cache + C2 压缩 re-inject）
+- 新 `llm/cache.py`：split_system_blocks + apply_cache_to_messages（3 断点 + static/dynamic 边界）
+- assembler 系统提示拆静态/动态两段；factory prompt_cache off/basic/full；openai_compatible 打 cache_control
+- compressor：extract_file_operations + 文件清单 + 压缩黑名单 + 受保护消息 re-inject；summarizer 附清单；memory 路径加权召回
+- 测试：test_prompt_cache(15) + test_context_compression(+9)
+
+### Stream C 信任（A1 作用域审批 + A2 拒绝回灌）
+- policy/approval.py：SessionGrantStore + ApprovalScope + scoped_decision（per-invocation/per-resource/per-tool）
+- base.py：Tool.permission_hint + ApprovalResponse.remember + ToolResult.denied/skipped（is_error=False）
+- executor：resource_key 计算 + 规则命中 + deny/skip 结构化回灌（human deny=info，infra deny=error）
+- cli.py：r 记住资源选项 + deny reason；approval_flow.py：结构化 decision 透传
+- 测试：test_approval_scoping(20) + test_approval_deny_reinject(10)
+
+### 协调者合并
+- 修 2 个过时测试（deny 语义 is_error True→False；e2e done 断言在 packet.type 而非 event.type）
+- react.py ToolContext 装配 grant_store（per-session 单例）
+- 全量 **1277 passed, 1 skipped**（基线 1190 → +87）；六条安全不变量测试 86 全过
+- 待接线：builtins.py permission_hint（executor _default_* 已等价）；AuditLog scope 字段

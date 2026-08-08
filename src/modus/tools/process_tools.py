@@ -80,15 +80,88 @@ def _pid_alive(pid: int | None) -> bool:
         return True  # exists but owned by another user
 
 
+def _read_born_at(pid: int) -> float | None:
+    """Read a process's start time (epoch seconds), cross-platform.
+
+    Used to detect PID reuse: a pid whose start time differs from what the
+    registry recorded is a *different* process that the OS handed the freed
+    pid to — killing it would hit an innocent bystander.
+    """
+    try:
+        # Linux: /proc/<pid>/stat field 22 is starttime in clock ticks since
+        # boot; convert to epoch via /proc/stat btime.
+        if os.path.exists(f"/proc/{pid}/stat") and os.path.exists("/proc/stat"):
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+                # Comm field can contain spaces/parens; split after the last ')'.
+                data = handle.read()
+            comm_end = data.rfind(")")
+            fields = data[comm_end + 2:].split()
+            # After comm, field index 19 in the full stat is starttime.
+            if len(fields) > 19:
+                ticks = int(fields[19])
+                btime = 0
+                try:
+                    with open("/proc/stat", encoding="utf-8") as handle:
+                        for line in handle:
+                            if line.startswith("btime "):
+                                btime = int(line.split()[1])
+                                break
+                except OSError:
+                    pass
+                hertz = os.sysconf("SC_CLK_TCK")
+                return btime + ticks / hertz
+        # macOS/BSD: `ps -o lstart= -p <pid>` → parse ISO-ish timestamp.
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            raw = out.stdout.strip()
+            # "Sat Aug  8 09:01:59 2026" → struct_time.  %d parses both
+            # zero-padded and space-padded days (macOS prints "Aug  8").
+            parsed = time.strptime(raw, "%a %b %d %H:%M:%S %Y")
+            return time.mktime(parsed)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _pid_identity_ok(meta: dict[str, Any]) -> bool:
+    """True when the recorded pid is alive AND its start time matches the
+    registry's ``born_at`` (i.e. it is genuinely the same process).
+
+    PID reuse: after Modus crashes, the OS may hand a freed pid to a new
+    process.  ``_pid_alive`` alone would report it as our old process; the
+    start-time check catches that the identity changed.
+    """
+    pid = meta.get("pid")
+    if not _pid_alive(pid):
+        return False
+    recorded = meta.get("born_at")
+    if not recorded:
+        # No start-time recorded (legacy entry) — fall back to pid-alive only.
+        return True
+    actual = _read_born_at(pid)
+    if actual is None:
+        return True  # cannot verify — do not fail closed on a read problem
+    # Allow a small skew: start time is captured after spawn, and ps rounding
+    # may differ by a fraction of a second.
+    return abs(actual - float(recorded)) < 1.0
+
+
 def _process_status(meta: dict[str, Any]) -> str:
     """Derive a live status from the registry entry + a pid probe.
 
     completed/failed  — the reaper recorded a natural exit (exit code 0 / != 0)
-    running           — registry says running AND the pid is alive
+    running           — registry says running AND the pid is alive AND its start
+                        time matches the recorded born_at
     stopped           — registry says running but the pid is gone (no reaper hit)
     orphaned          — registry says running AND the pid is alive, but no Modus
                         process currently owns the registry (Desktop was killed and
                         restarted); the process is still running but unattended
+    pid_reused        — registry says running AND the pid is alive, but its start
+                        time differs from born_at: the OS handed our old pid to a
+                        different process.  Killing it would hit a bystander.
     exited            — recorded a terminal exit code from kill
     """
     status = str(meta.get("status") or "running")
@@ -96,9 +169,12 @@ def _process_status(meta: dict[str, Any]) -> str:
         return status
     if status != "running":
         return status
-    alive = _pid_alive(meta.get("pid"))
+    pid = meta.get("pid")
+    alive = _pid_alive(pid)
     owned = _owned_by_this_process(meta)
     if alive:
+        if not _pid_identity_ok(meta):
+            return "pid_reused"
         return "running" if owned else "orphaned"
     return "stopped"
 
@@ -171,6 +247,7 @@ async def spawn_process(payload: dict[str, Any], context: ToolContext) -> ToolRe
         "cwd": str(payload.get("cwd") or context.cwd or os.getcwd()),
         "status": "running",
         "started_at": time.time(),
+        "born_at": _read_born_at(proc.pid),
         "spawned_by": os.getpid(),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
@@ -264,6 +341,17 @@ async def kill_process(payload: dict[str, Any], context: ToolContext) -> ToolRes
         meta["status"] = "stopped"
         _write_meta(process_id, meta)
         return ToolResult(f"process {process_id} is already stopped", is_error=False)
+    # PID-reuse guard: the recorded pid must still be the *same* process.  If
+    # the OS handed our old pid to a different process (start time differs),
+    # killing it would SIGKILL an innocent bystander — refuse instead.
+    if not _pid_identity_ok(meta):
+        meta["status"] = "pid_reused"
+        _write_meta(process_id, meta)
+        return ToolResult(
+            f"process {process_id} pid {pid} was reused by another process — "
+            f"refusing to kill a bystander (mark status=pid_reused)",
+            is_error=True,
+        )
     # Kill the whole process group (the spawn used start_new_session).
     try:
         if os.name == "nt":

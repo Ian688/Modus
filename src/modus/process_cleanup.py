@@ -67,7 +67,7 @@ def cleanup_spawned_processes(*, signal_triggered: bool = False) -> None:
     Idempotent and best-effort: a failure to reach one process never blocks the
     rest, and never raises (cleanup must not break interpreter exit).
     """
-    from modus.tools.process_tools import _pid_alive, _write_meta
+    from modus.tools.process_tools import _pid_alive, _pid_identity_ok, _write_meta
 
     owned = _iter_owned_meta()
     live: list[tuple[str, dict[str, Any]]] = []
@@ -75,7 +75,10 @@ def cleanup_spawned_processes(*, signal_triggered: bool = False) -> None:
         status = str(meta.get("status") or "running")
         if status in ("exited", "stopped"):
             continue
-        if _pid_alive(meta.get("pid")):
+        # Identity check: a pid alive but with a different start time means the
+        # OS reused our old pid for a different process — do not kill a
+        # bystander on an unrelated close.
+        if _pid_alive(meta.get("pid")) and _pid_identity_ok(meta):
             live.append((process_id, meta))
 
     if not live:

@@ -98,12 +98,11 @@ def test_opt_in_approval_fixture_deny_writes_nothing(monkeypatch, guard_home):
             terminal = _until(socket, {"done"})
 
     assert not (guard_home / "approval-proof.txt").exists()
-    assert any(
-        packet.get("type") == "agent_event"
-        and packet["event"].get("type") == "run_error"
-        and "approval denied" in packet["event"]["payload"]["message"].lower()
-        for packet in terminal
-    )
+    # Wave-3 A2: a human deny is INFORMATION, not an error — the run completes
+    # (done, not run_error) and the model receives the refusal as a tool result
+    # so it can see and redirect.  The fixture handler is a write-only proof
+    # that must never have executed, so the terminal is a normal done.
+    assert any(packet.get("type") == "done" for packet in terminal)
 
 
 def test_second_browser_action_cannot_replay_resolved_approval(monkeypatch, guard_home):

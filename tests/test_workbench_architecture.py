@@ -837,3 +837,41 @@ def test_kanban_board_attention_marker_is_declared():
     assert "columnAttentionCount" in kanban
     assert "data-kb-attention" in kanban
     assert 'type:"kanban_board"' not in js  # server command, not a client send
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_command_disabled(tmp_path, monkeypatch):
+    """Wave-0 worker_pool WS command reports disabled when the layer is off."""
+    from modus.desktop import db, server
+
+    monkeypatch.setattr(db, "DB_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "desktop.db")
+    db.init_db()
+    current = db.create_session("Workers")
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, value):
+            self.sent.append(value)
+
+    socket = Socket()
+    session = server.DaoSession(id="runtime", db_id=current["id"])
+    # Force the pool singleton to None so the command reports disabled.
+    import modus.runtime.workers as wrk
+
+    monkeypatch.setattr(wrk, "_pool", None)
+
+    await server.command_router.dispatch(socket, session, {
+        "type": "worker_pool", "operation": "list",
+        "session_id": current["id"], "request_id": "wp-request",
+    })
+
+    packet = socket.sent[-1]
+    assert packet["type"] == "worker_pool"
+    assert packet["operation"] == "list"
+    assert packet["request_id"] == "wp-request"
+    # Worker layer is disabled by default → enabled: False and no workers.
+    assert packet["enabled"] is False
+    assert packet["workers"] == []

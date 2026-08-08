@@ -71,6 +71,90 @@ def _ensure_side_repo(project_root: str) -> None:
     )
 
 
+def _prune_one_project(project_root: str, retain: int) -> int:
+    """Drop the oldest side-repo snapshots beyond ``retain`` for one project.
+
+    A bare repo's history is only reachable through its branch tip (or reflog).
+    ``list_snapshots`` walks that history, so pruning is: replay the retained
+    commits onto a fresh branch (``git commit-tree`` keeps each snapshot's tree,
+    message and author, but parents it only to the previous *retained* commit),
+    repoint the branch tip at the replayed head, then expire the reflog and
+    ``gc --prune`` so the dropped commits/trees/blobs are removed from disk.
+    Only Modus's own side repo under ``~/.modus/snapshots`` is touched, and
+    nothing outside it is ever modified.
+    """
+    try:
+        root = str(Path(project_root or os.getcwd()).resolve())
+        side_dir = _side_git_dir(root)
+        if not (side_dir / "config").exists():
+            return 0
+        snaps = list_snapshots(root, limit=10_000)
+        if len(snaps) <= retain:
+            return 0
+        kept = snaps[:retain]
+        dropped = snaps[retain:]
+        new_parent: str | None = None
+        for snap in reversed(kept):
+            tree_stdout, _, rev_code = _git(root, "rev-parse", f"{snap.commit_id}^{{tree}}")
+            if rev_code != 0:
+                return 0
+            tree = tree_stdout.strip()
+            if not tree:
+                return 0
+            cmd: list[str] = ["commit-tree", tree, "-m", snap.summary or snap.phase]
+            if new_parent:
+                cmd += ["-p", new_parent]
+            commit_out, _, code = _git(root, *cmd)
+            if code != 0 or not commit_out.strip():
+                return 0
+            new_parent = commit_out.strip()
+        if not new_parent:
+            return 0
+        _git(root, "update-ref", "refs/heads/master", new_parent)
+        _git_plain(side_dir, "reflog", "expire", "--expire=now", "--all")
+        _git_plain(side_dir, "gc", "--prune=now", "--quiet")
+        return len(dropped)
+    except Exception:
+        return 0
+
+
+def _git_plain(side_dir: Path, *args: str) -> tuple[str, str, int]:
+    """Run a git command against the side repo without a work-tree (gc/refs)."""
+    proc = subprocess.run(
+        ["git", "-C", str(side_dir), *args],
+        capture_output=True, text=True, timeout=120.0,
+    )
+    return proc.stdout, proc.stderr, proc.returncode or 0
+
+
+def prune_snapshots(
+    project_roots: list[str] | None = None,
+    *,
+    retain_per_run: int = 50,
+) -> int:
+    """Best-effort prune of side-repo snapshots per project.
+
+    Defaults to every side repo already recorded under ``~/.modus/snapshots``.
+    Returns the total number of snapshots dropped.  Never raises and never
+    touches anything outside Modus's own data directory.
+    """
+    retain = max(1, int(retain_per_run))
+    roots: list[str] = []
+    if project_roots is None:
+        base = Path(data_path("snapshots"))
+        if base.is_dir():
+            roots = [str(child) for child in base.iterdir() if child.is_dir()]
+    else:
+        roots = [str(r) for r in project_roots]
+    dropped = 0
+    for root in roots:
+        try:
+            dropped += _prune_one_project(root, retain)
+        except Exception:
+            continue
+    return dropped
+
+
 def create_snapshot(
     project_root: str,
     phase: str = "pre-turn",

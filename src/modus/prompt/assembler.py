@@ -5,8 +5,27 @@ from pathlib import Path
 
 from modus.config import ModusConfig
 
+# Prompt-cache boundary markers (Wave2 C1): the assembled prompt is split into a
+# static block (role/capability/tool declarations and guidelines — stable across
+# turns) and a dynamic block (current time, working directory, model/provider —
+# changes every session).  ``modus.llm.cache.split_system_blocks`` splits at
+# these markers so the static block can be cached independently of the dynamic
+# one.  When prompt caching is disabled the markers are stripped before sending.
+from modus.llm.cache import DYNAMIC_BOUNDARY, STATIC_BOUNDARY
+
 class PromptAssembler:
-    """组装 system prompt——注入工具列表、时间、工作目录、项目记忆"""
+    """组装 system prompt——注入工具列表、时间、工作目录、项目记忆
+
+    The prompt is built as two blocks separated by cache boundary markers:
+
+    - static block: role definition, model/capability declaration, tool list
+      and the guidelines.  Content is deterministic for a given config/workspace
+      (tool names and cwd are stable within a session), so the block is a good
+      cache prefix.
+    - dynamic block: current time, working directory, model/provider.  This is
+      what changes between sessions; splitting it off keeps the static block's
+      provider-side cache valid.
+    """
 
     def __init__(
         self,
@@ -23,14 +42,8 @@ class PromptAssembler:
         self.provider = provider
 
     def build(self) -> str:
-        parts = [
+        static_parts = [
             "You are Modus, a capable AI coding agent.",
-            f"Current time: {datetime.now().isoformat(timespec='seconds')}",
-            (
-                f"Working directory: {self.cwd}"
-                if self.cwd else
-                "No workspace is selected. Answer conversationally and do not claim to read, write, run, or inspect local files."
-            ),
             f"Model: {self.model} ({self.provider})",
             f"Available tools: {', '.join(self.tool_names)}",
             "",
@@ -69,4 +82,23 @@ class PromptAssembler:
             "headings with `- ` bullets) before starting, then follow the numbered execution "
             "with a fenced ```steps block listing each step you actually took.",
         ]
-        return "\n".join(parts)
+        static = "\n".join(static_parts)
+
+        dynamic_parts = [
+            f"Current time: {datetime.now().isoformat(timespec='seconds')}",
+            (
+                f"Working directory: {self.cwd}"
+                if self.cwd else
+                "No workspace is selected. Answer conversationally and do not claim to read, write, run, or inspect local files."
+            ),
+        ]
+        dynamic = "\n".join(dynamic_parts)
+
+        # The static block is emitted first (stable cache prefix), then the
+        # dynamic boundary marker, then the dynamic block.
+        return (
+            f"{static}\n"
+            f"{STATIC_BOUNDARY}\n"
+            f"{DYNAMIC_BOUNDARY}\n"
+            f"{dynamic}"
+        )

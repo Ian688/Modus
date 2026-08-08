@@ -47,20 +47,23 @@ def _format_approval_input(data: dict) -> str:
 
 
 async def _cli_approval_callback(request: dict) -> str:
-    """Terminal HITL approval: rich card + y/n/s/m decision.
+    """Terminal HITL approval: rich card + y/n/s/m/r decision.
 
     The executor has already decided this tool needs approval (ApprovalPolicy)
     and validated it (CommandGuard / PathGuard / input_hash).  This callback is
-    the human confirmation only; returning anything but "approve" fails closed.
+    the human confirmation only; returning anything but an approve fails closed.
     Decisions:
       y  approve as-is
-      n  deny (tool reports an error)
+      n  deny (structured result, with an optional reason the agent can see)
       s  skip (tool does not run; the run continues)
       m  modify the tool arguments, then approve the edited payload
+      r  approve AND remember this resource for the session (A1 per-resource
+         grant: the same resource is not re-asked within this session)
     """
     from rich import box
     from rich.panel import Panel
     from rich.prompt import Prompt
+    from modus.tools.base import ApprovalResponse
 
     danger = str(request.get("danger_level") or "medium")
     style = {"high": "red", "medium": "yellow", "safe": "green"}.get(danger, "yellow")
@@ -71,6 +74,8 @@ async def _cli_approval_callback(request: dict) -> str:
         f"数据披露: {request.get('data_disclosure') or 'none'}",
         f"影响: {request.get('impact_class') or 'undetermined'}",
     ]
+    if request.get("resource_key"):
+        lines.append(f"资源: [cyan]{request['resource_key']}[/cyan]")
     if request.get("description"):
         lines.append(f"描述: {request['description']}")
     lines.append(f"参数:\n{_format_approval_input(request.get('input') or {})}")
@@ -81,27 +86,66 @@ async def _cli_approval_callback(request: dict) -> str:
         )
     )
     answer = Prompt.ask(
-        "批准执行? [y]批准 [n]拒绝 [s]跳过 [m]改参",
-        choices=["y", "n", "s", "m"], default="n", show_choices=False,
+        "批准执行? [y]批准 [n]拒绝 [s]跳过 [m]改参 [r]批准并记住本资源",
+        choices=["y", "n", "s", "m", "r"], default="n", show_choices=False,
     )
     decision = answer.strip().lower()
     if decision == "y":
         _record_cli_audit("approved", request, "y")
         return "approve"
+    if decision == "r":
+        # A1 per-resource session grant: approve this exact resource and ask
+        # the executor to remember it for the session.
+        _record_cli_audit("approved", request, "r")
+        return ApprovalResponse.approve(remember=True)
     if decision == "s":
         _record_cli_audit("skipped", request, "s")
         return "skip"
     if decision == "m":
         modified = _prompt_modified_args(request.get("input") or {})
         if modified is not None:
-            from modus.tools.base import ApprovalResponse
-
-            _record_cli_audit("modified", request, "m")
-            return ApprovalResponse.modify(modified)
+            remember = _prompt_remember_modified()
+            _record_cli_audit("modified", request, f"m{'+r' if remember else ''}")
+            return ApprovalResponse.modify(modified, remember=remember)
         _record_cli_audit("denied", request, "m-invalid")
-        return "deny"  # failed to produce a valid modification
+        return ApprovalResponse.deny("modified input was invalid")
+    reason = _prompt_deny_reason()
     _record_cli_audit("denied", request, "n")
-    return "deny"
+    return ApprovalResponse.deny(reason=reason)
+
+
+def _prompt_remember_modified() -> bool:
+    """Ask whether to remember the *modified* resource for the session (A1).
+
+    The executor records the grant under the resource key of the modified
+    payload the human approved, so a later identical (edited) resource is not
+    re-asked within the session.
+    """
+    from rich.prompt import Prompt
+
+    try:
+        raw = Prompt.ask(
+            "记住改后的这个资源本会话? [y]是 [n]否",
+            choices=["y", "n"], default="n", show_choices=False,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return str(raw).strip().lower() in {"y", "r"}
+
+
+def _prompt_deny_reason() -> str:
+    """Collect an optional denial reason for A2 deny re-injection.
+
+    Returns an empty string when the user skips the prompt; the deny result is
+    then still a structured non-error tool result, just without a reason.
+    """
+    from rich.prompt import Prompt
+
+    try:
+        raw = Prompt.ask("拒绝原因（可选，直接回车跳过）", default="")
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    return str(raw or "").strip()
 
 
 def _record_cli_audit(outcome: str, request: dict, detail: str) -> None:

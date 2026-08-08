@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,17 +16,338 @@ from modus.redact import redact_dict
 from modus.modes import DEFAULT_MODE, normalize_mode
 from modus.paths import data_dir
 
+logger = logging.getLogger(__name__)
+
 DB_DIR = data_dir()
 DB_PATH = DB_DIR / "desktop.db"
 
+# True once the process has validated the database at least once (startup
+# quick_check).  Tests that swap ``DB_PATH`` per-case reset it explicitly.
+_integrity_checked = False
+# Reentrancy guard so corruption recovery never recursively recovers itself.
+_recovering = False
+# Periodic WAL checkpoint cadence (approximate, per _get_conn open).
+_checkpoint_calls = 0
+_CHECKPOINT_EVERY = 128
 
-def _get_conn() -> sqlite3.Connection:
+
+def _raw_conn() -> sqlite3.Connection:
+    """Open a plain connection without integrity/recovery wrappers."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _wal_checkpoint(conn: sqlite3.Connection) -> None:
+    """Best-effort WAL truncate so the WAL never grows without bound."""
+    with suppress(sqlite3.Error):
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
+def checkpoint_now() -> int:
+    """Force a WAL checkpoint(TRUNCATE) now.  Returns frames checkpointed."""
+    if not DB_PATH.exists():
+        return 0
+    try:
+        with _raw_conn() as conn:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            return int(row[2]) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Open a connection, validating and (once) repairing database integrity.
+
+    Startup validation: ``PRAGMA quick_check`` runs once per process.  A
+    corrupted database is backed up to ``~/.modus/backup/``, reopened fresh,
+    and its run ledger is salvaged from the recoverable ``run_events`` (reusing
+    ``interrupt_nonterminal_runs`` semantics so dead work settles as
+    ``interrupted/process_restart``, never as running).  WAL checkpoint runs
+    periodically so a long-lived Desktop keeps its WAL bounded.
+    """
+    global _integrity_checked
+    try:
+        conn = _raw_conn()
+    except sqlite3.DatabaseError:
+        _recover_corrupt_db()
+        conn = _raw_conn()
+    conn.row_factory = sqlite3.Row
+    if not _integrity_checked and DB_PATH.exists():
+        _integrity_checked = True
+        try:
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            healthy = bool(rows) and str(rows[0][0]).lower() == "ok"
+        except sqlite3.DatabaseError:
+            healthy = False
+        if not healthy:
+            conn.close()
+            _recover_corrupt_db()
+            conn = _raw_conn()
+            conn.row_factory = sqlite3.Row
+    global _checkpoint_calls
+    _checkpoint_calls += 1
+    if _checkpoint_calls % _CHECKPOINT_EVERY == 0:
+        _wal_checkpoint(conn)
+    return conn
+
+
+def _rename_quiet(src: Path, dst: Path) -> None:
+    with suppress(OSError):
+        src.rename(dst)
+
+
+def _recover_corrupt_db() -> None:
+    """Back up a corrupted database and reopen a fresh, valid one.
+
+    Only Modus's own data directory is touched.  The corrupt file is preserved
+    both in-place (``desktop.db.corrupt.<ts>``) and in ``~/.modus/backup/``.
+    Best-effort salvage then replays the recoverable tables into the fresh DB,
+    settling any non-terminal runs as ``interrupted/process_restart``.
+    """
+    global _recovering, _integrity_checked
+    if _recovering:
+        return
+    _recovering = True
+    try:
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup_dir = DB_DIR / "backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        salvaged = _salvage_from_db(DB_PATH)
+        corrupt_main = DB_DIR / f"desktop.db.corrupt.{ts}"
+        _rename_quiet(DB_PATH, corrupt_main)
+        for suffix in ("-wal", "-shm"):
+            _rename_quiet(Path(str(DB_PATH) + suffix), DB_DIR / f"desktop.db{suffix}.corrupt.{ts}")
+        if corrupt_main.exists():
+            with suppress(OSError):
+                shutil.copy2(corrupt_main, backup_dir / f"desktop.db.corrupt.{ts}")
+        # Fresh database with the full schema.
+        init_db()
+        _replay_salvaged(salvaged)
+        logger.warning(
+            "corrupted database recovered: %s moved aside; fresh desktop.db opened",
+            corrupt_main,
+        )
+    finally:
+        _recovering = False
+        _integrity_checked = True
+
+
+# Tables salvaged in FK-safe order on corruption recovery.
+_SALVAGE_ORDER = [
+    "workspaces", "users", "account_workspaces", "sessions", "runs",
+    "run_tasks", "run_events", "context_compactions", "approvals",
+    "artifacts", "memories", "messages",
+]
+
+
+def _salvage_from_db(db_path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Best-effort read of the recoverable tables from a damaged database."""
+    result: dict[str, list[dict[str, Any]]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        return result
+    try:
+        for table in _SALVAGE_ORDER:
+            try:
+                cols = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                if not cols:
+                    continue
+                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+                result[table] = [dict(zip(cols, row)) for row in rows]
+            except sqlite3.DatabaseError:
+                # Partial salvage is better than none; keep what we have.
+                logger.warning("salvage could not read table %s from corrupt db", table)
+                continue
+    finally:
+        with suppress(Exception):
+            conn.close()
+    return result
+
+
+def _replay_salvaged(salvaged: dict[str, list[dict[str, Any]]]) -> int:
+    """Replay salvaged rows into the fresh database, settling dead runs.
+
+    Running runs become ``interrupted/process_restart``, undecided approvals
+    become ``deny/process_restart``, and non-terminal tasks become
+    ``cancelled`` — the same settlement ``interrupt_nonterminal_runs`` applies
+    so a restored Desktop never presents dead work as running.
+    """
+    now = time.time()
+    replayed = 0
+    for table in _SALVAGE_ORDER:
+        rows = salvaged.get(table) or []
+        if not rows:
+            continue
+        with _raw_conn() as conn:
+            # Best-effort replay: the fresh DB enforces FKs by default, but a
+            # partially salvaged source may have orphaned rows.  Orphans are
+            # skipped rather than aborting the whole recovery.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            cols = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if not cols:
+                continue
+            for row in rows:
+                if table == "runs" and str(row.get("state") or "") == "running":
+                    row = dict(row)
+                    row["state"] = "interrupted"
+                    row["stop_reason"] = "process_restart"
+                    row["error"] = "database recovered from corruption"
+                    row["updated_at"] = now
+                    row["ended_at"] = now
+                elif table == "approvals" and row.get("decision") is None:
+                    row = dict(row)
+                    row["decision"] = "deny"
+                    row["resolution_reason"] = "process_restart"
+                    row["decided_at"] = now
+                elif table == "run_tasks" and str(row.get("status") or "") not in (
+                    "completed", "failed", "cancelled",
+                ):
+                    row = dict(row)
+                    row["status"] = "cancelled"
+                    row["updated_at"] = now
+                values = {key: row.get(key) for key in cols if key in row}
+                if not values:
+                    continue
+                try:
+                    placeholders = ", ".join("?" for _ in values)
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO {table} ({', '.join(values)}) VALUES ({placeholders})",
+                        [values[key] for key in values],
+                    )
+                    replayed += 1
+                except sqlite3.Error:
+                    # One bad row must not block the remaining salvage.
+                    logger.warning("replay skipped a %s row during recovery", table)
+                    continue
+    return replayed
+
+
+def _parse_event_timestamp(value: str | None) -> float | None:
+    """Parse a run_events ``timestamp`` ISO string into an epoch float."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _remove_artifact_file(storage_path: str) -> bool:
+    """Delete an artifact file only when it lives inside Modus's private store."""
+    try:
+        root = (DB_DIR / "artifacts").resolve()
+        path = Path(storage_path).resolve()
+        if root in path.parents:
+            path.unlink(missing_ok=True)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def prune_expired(
+    *, config: Any = None, env: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    """Report (and, when enabled, apply) retention for Modus's own data plane.
+
+    Conservative and reversible: unless ``config.storage.enable_prune`` is true,
+    nothing is deleted or modified — every candidate is merely reported.  All
+    deletion is bounded to Modus's private data directory (desktop.db rows,
+    artifact files under the private store, side-repo snapshots); user
+    workspace files are never candidates.  Idempotent.
+    """
+    from modus.config import load_config
+
+    cfg = config if config is not None else load_config(env=env)
+    storage = cfg.storage
+    report: dict[str, Any] = {
+        "run_events_candidates": 0,
+        "run_events_deleted": 0,
+        "artifacts_candidates": 0,
+        "artifacts_bytes_candidates": 0,
+        "artifacts_deleted": 0,
+        "memories_soft_expire_candidates": 0,
+        "memories_archived": 0,
+        "snapshot_dropped": 0,
+    }
+    if not DB_PATH.exists():
+        return report
+    now = time.time()
+
+    # ── run_events retention ──
+    with _raw_conn() as conn:
+        expired_ids: list[str] = []
+        for row in conn.execute("SELECT event_id, timestamp FROM run_events").fetchall():
+            ts = _parse_event_timestamp(str(row["timestamp"] or ""))
+            if ts is not None and now - ts > storage.run_events_retain_days * 86400:
+                expired_ids.append(str(row["event_id"]))
+        report["run_events_candidates"] = len(expired_ids)
+        if storage.enable_prune and expired_ids:
+            placeholders = ",".join("?" for _ in expired_ids)
+            cursor = conn.execute(
+                f"DELETE FROM run_events WHERE event_id IN ({placeholders})", expired_ids,
+            )
+            report["run_events_deleted"] = cursor.rowcount
+
+        # ── artifact quota (bytes + count), oldest first ──
+        arts = conn.execute(
+            "SELECT artifact_id, storage_path, size_bytes, created_at "
+            "FROM artifacts ORDER BY created_at, artifact_id",
+        ).fetchall()
+        total_bytes = sum(int(a["size_bytes"] or 0) for a in arts)
+        delete_count = 0
+        running = total_bytes
+        for art in arts:
+            if running <= storage.artifacts_max_bytes and (
+                len(arts) - delete_count
+            ) <= storage.artifacts_max_count:
+                break
+            delete_count += 1
+            running -= int(art["size_bytes"] or 0)
+        to_delete = arts[:delete_count]
+        report["artifacts_candidates"] = len(to_delete)
+        report["artifacts_bytes_candidates"] = sum(
+            int(a["size_bytes"] or 0) for a in to_delete
+        )
+        if storage.enable_prune and to_delete:
+            deleted = 0
+            for art in to_delete:
+                _remove_artifact_file(str(art["storage_path"] or ""))
+                conn.execute(
+                    "DELETE FROM artifacts WHERE artifact_id=?", (str(art["artifact_id"]),),
+                )
+                deleted += 1
+            report["artifacts_deleted"] = deleted
+
+        # ── memories soft-expire (archive, never delete) ──
+        archive_ids: list[str] = []
+        for row in conn.execute(
+            "SELECT memory_id, updated_at FROM memories WHERE status='active'",
+        ).fetchall():
+            updated = row["updated_at"]
+            if updated is not None and now - float(updated) > storage.memories_soft_expire_days * 86400:
+                archive_ids.append(str(row["memory_id"]))
+        report["memories_soft_expire_candidates"] = len(archive_ids)
+        if storage.enable_prune and archive_ids:
+            placeholders = ",".join("?" for _ in archive_ids)
+            cursor = conn.execute(
+                f"UPDATE memories SET status='archived', updated_at=? "
+                f"WHERE memory_id IN ({placeholders})",
+                [now, *archive_ids],
+            )
+            report["memories_archived"] = cursor.rowcount
+
+    # ── side-git snapshot retention (Modus's side repos only) ──
+    if storage.enable_prune:
+        from modus.tools.snapshot import prune_snapshots
+
+        report["snapshot_dropped"] = prune_snapshots(
+            retain_per_run=storage.snapshot_retain_per_run,
+        )
+    return report
 
 
 def init_db() -> None:

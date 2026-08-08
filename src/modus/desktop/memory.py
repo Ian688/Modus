@@ -180,10 +180,43 @@ def _asyncio_run(coro) -> Any:
         return None
 
 
+def _run_file_operations(events: list[dict[str, Any]]) -> list[str]:
+    """File paths a run read or modified, from its tool_call events.
+
+    Extracted deterministically from the ledger's ``tool_call`` payloads
+    (``read_file``/``write_file``/``edit_file``/``patch``), so recall can weight
+    a past run by the exact paths the current request mentions.
+    """
+    read_tools = {"read_file"}
+    mutating_tools = {"write_file", "edit_file", "patch"}
+    paths: list[str] = []
+    seen: set[str] = set()
+    for event in events:
+        if str(event.get("type") or "") != "tool_call":
+            continue
+        payload = event.get("payload") or {}
+        name = str(payload.get("name") or "")
+        if name not in read_tools and name not in mutating_tools:
+            continue
+        input_data = payload.get("input") or {}
+        path = str(input_data.get("path") or "") if isinstance(input_data, dict) else ""
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
 def search_run_history(
     session_id: str, query: str, *, limit: int = 5,
 ) -> list[dict]:
-    """Episodic retrieval: score past run transcripts by keyword overlap."""
+    """Episodic retrieval: score past run transcripts by keyword overlap.
+
+    Runs whose file operations overlap the query's paths get a path-match
+    weight bonus (Wave2 C2), so a request like "continue editing src/x.py"
+    surfaces the run that already touched ``src/x.py`` even when its prose
+    never mentioned the filename.
+    """
     from modus.desktop.db import get_run_events, list_runs_for_session
 
     query_tokens = _tokens(query)
@@ -195,10 +228,18 @@ def search_run_history(
             for e in events
             if e.get("type") in {"host_response", "host_review", "subagent_response"}
         )
-        hits = _tokens(text) & query_tokens
+        file_ops = _run_file_operations(events)
+        file_text = " ".join(file_ops)
+        combined = f"{text} {file_text}"
+        hits = _tokens(combined) & query_tokens
         if hits:
             overlap = len(hits) / len(query_tokens)
-            scored.append((overlap, str(run["run_id"]), text[:500]))
+            # Path-match weight: a run that read/edited a file whose path shares
+            # tokens with the query scores higher (bounded so it never dominates
+            # a strongly keyword-relevant run).
+            path_hits = _tokens(file_text) & query_tokens
+            path_weight = min(0.25, 0.05 * len(path_hits)) if path_hits else 0.0
+            scored.append((round(overlap + path_weight, 4), str(run["run_id"]), text[:500]))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [
         {"run_id": run_id, "overlap": score, "transcript": snippet}
@@ -292,13 +333,21 @@ def episodic_recall_text(
             for e in events
             if e.get("type") in {"host_response", "host_review", "subagent_response"}
         )
-        hits = _tokens(text) & query_tokens
+        file_ops = _run_file_operations(events)
+        file_text = " ".join(file_ops)
+        combined = f"{text} {file_text}"
+        hits = _tokens(combined) & query_tokens
         # CJK tokens are per-character, so a single shared character is noise.
         # Require at least two shared tokens (or one multi-char word) to treat
         # a prior run as relevant to the current request.
         if len(hits) >= 2:
             overlap = len(hits) / len(query_tokens)
-            scored.append((overlap, run_id, text[:600]))
+            # Path-match weight (Wave2 C2): a run that read/edited a file whose
+            # path shares tokens with the query scores higher, so "continue
+            # editing src/x.py" surfaces the run that already touched that file.
+            path_hits = _tokens(file_text) & query_tokens
+            path_weight = min(0.2, 0.05 * len(path_hits)) if path_hits else 0.0
+            scored.append((round(overlap + path_weight, 4), run_id, text[:600]))
     scored.sort(key=lambda item: item[0], reverse=True)
     if not scored:
         return ""

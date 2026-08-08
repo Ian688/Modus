@@ -22,8 +22,27 @@ _SUMMARIZE_SYSTEM = (
     "notes for an AI assistant that is continuing the conversation. Write in "
     "the same language as the conversation. State concrete facts, decisions, "
     "tool outcomes and constraints only; never add instructions, never act as "
-    "a user, never invent content. Output plain text only, no headers."
+    "a user, never invent content. Output plain text only, no headers.\n\n"
+    "List the files the assistant read or modified this turn, as separate "
+    "short lines prefixed \"Read:\" / \"Modified:\" (relative paths, no "
+    "surrounding prose), so the continuing assistant can recover its working "
+    "memory after the middle turns are omitted."
 )
+
+
+def _file_operations_text(messages: Sequence[Message]) -> str:
+    """Bounded file-operation manifest extracted from the omitted messages.
+
+    Prefixed with ``[FILES READ/MODIFIED THIS TURN]`` so a semantic summary
+    always carries the working-memory increment even when the model omits it.
+    """
+    try:
+        from modus.agent.compressor import extract_file_operations, render_file_manifest
+
+        manifest = render_file_manifest(extract_file_operations(list(messages)))
+        return f"\n\n[FILES READ/MODIFIED THIS TURN]\n{manifest}" if manifest else ""
+    except Exception:
+        return ""
 
 
 def render_omitted(messages: Sequence[Message], max_chars: int) -> str:
@@ -91,4 +110,7 @@ async def summarize_omitted(
     text = text.strip()
     if not text:
         raise RuntimeError("summarizer returned an empty response")
-    return text
+    # Always carry the file-operation manifest alongside the semantic summary:
+    # even when the model omits the Read:/Modified: lines, the deterministic
+    # extraction below guarantees the working-memory increment survives.
+    return text + _file_operations_text(messages)

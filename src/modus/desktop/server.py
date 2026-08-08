@@ -98,18 +98,43 @@ class _SerializedWebSocket:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._websocket, name)
 
+async def _broadcast_user_notice(message: str) -> None:
+    """Push a transient banner to every connected Desktop window."""
+    packet = {"type": "user_notice", "message": message}
+    for _connected, socket in manager.websocket_items():
+        try:
+            await socket.send_json(packet)
+        except Exception:
+            continue
+
+
+def _schedule_user_notice(message: str) -> None:
+    """Fire-and-forget the banner broadcast from a sync watchdog callback."""
+    try:
+        asyncio.get_event_loop().create_task(_broadcast_user_notice(message))
+    except RuntimeError:
+        logger.warning("user notice dropped: no running event loop: %s", message)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     from modus.desktop.db import interrupt_nonterminal_runs
+    from modus.health import Probes, install_watchdog
 
     init_db()
     if _desktop_default_workspace_root:
         upsert_workspace(WorkspaceIdentity.from_path(_desktop_default_workspace_root))
     interrupt_nonterminal_runs()
     await mcp_manager.connect_all()
+    Probes.notify = _schedule_user_notice
+    install_watchdog()
     try:
         yield
     finally:
+        from modus.health import _watchdog
+
+        await _watchdog.stop()
+        Probes.notify = None
         await mcp_manager.disconnect_all()
 
 
@@ -1371,6 +1396,49 @@ async def _handle_kanban_board(
 
 
 command_router.register("kanban_board", _handle_kanban_board)
+
+
+async def _handle_worker_pool(
+    websocket: WebSocket, session: DaoSession, message: dict[str, Any],
+) -> None:
+    """Surface the Wave-0 concurrency worker pool: list / status / drain events.
+
+    Read-only over the worker layer.  Never starts or cancels work directly —
+    workers are created by tools (office_exec) and cancelled by the pool's own
+    timeout/watchdog.  This is the desktop's visibility into "which heavy jobs
+    are running and how much memory they hold".
+    """
+    from modus.runtime.workers import _worker_pool_for
+
+    request_id = str(message.get("request_id") or "")[:128]
+    operation = str(message.get("operation") or "list")
+    pool = _worker_pool_for()
+    if pool is None:
+        await websocket.send_json({
+            "type": "worker_pool", "operation": operation,
+            "request_id": request_id, "session_id": str(session.db_id or ""),
+            "enabled": False, "workers": [],
+        })
+        return
+    if operation == "status":
+        worker_id = str(message.get("worker_id") or "")
+        state = await pool.status(worker_id) if worker_id else None
+        await websocket.send_json({
+            "type": "worker_pool", "operation": operation,
+            "request_id": request_id, "session_id": str(session.db_id or ""),
+            "enabled": True, "worker": state,
+        })
+        return
+    workers = await pool.list_workers(limit=50)
+    events = await pool.drain_events(limit=50)
+    await websocket.send_json({
+        "type": "worker_pool", "operation": operation,
+        "request_id": request_id, "session_id": str(session.db_id or ""),
+        "enabled": True, "workers": workers, "events": events,
+    })
+
+
+command_router.register("worker_pool", _handle_worker_pool)
 
 
 async def _handle_credential_migration_report(

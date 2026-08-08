@@ -20,6 +20,12 @@ class OpenAICompatibleClient:
     timeout: float = 120.0
     max_context_window: int = 128_000
     prompt_cache: bool = False
+    # Prompt-cache breakpoint engineering (Wave2 C1).  When ``enable_prompt_cache``
+    # is set, ``_format_messages`` splits the system prompt into a static block
+    # and a dynamic block, marks the static block with ``cache_control`` and adds
+    # user-message cache breakpoints (first + last ``cache_breakpoints`` users).
+    enable_prompt_cache: bool = False
+    cache_breakpoints: int = 3
     supports_images: bool = False
     supports_tools: bool = True
     reasoning_effort: str | None = None
@@ -128,7 +134,23 @@ class OpenAICompatibleClient:
         return [item["embedding"] for item in data.get("data", [])]
 
     def _format_messages(self, messages: list[Message], system_prompt: str) -> list[dict[str, Any]]:
-        formatted: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        formatted: list[dict[str, Any]] = []
+        if self.enable_prompt_cache:
+            from modus.llm.cache import apply_cache_to_messages, split_system_blocks
+
+            # Split the assembled prompt at the static/dynamic boundary so the
+            # stable role/capability/tool block can be cached independently of
+            # the per-turn env/memory/time block.  A prompt with no boundary
+            # marker is fully static and is kept as a single system message.
+            static, dynamic = split_system_blocks(system_prompt)
+            if static:
+                formatted.append({"role": "system", "content": static})
+            if dynamic:
+                formatted.append({"role": "system", "content": dynamic})
+        else:
+            from modus.llm.cache import strip_system_markers
+
+            formatted.append({"role": "system", "content": strip_system_markers(system_prompt)})
         for message in messages:
             if message.role == "tool":
                 formatted.append(
@@ -147,6 +169,10 @@ class OpenAICompatibleClient:
                 formatted.append(
                     {"role": message.role, "content": self._format_content(message.content)}
                 )
+        if self.enable_prompt_cache:
+            # Mark the first system message (static block) with cache_control and
+            # add user-message breakpoints (first + last ``cache_breakpoints``).
+            formatted = apply_cache_to_messages(formatted, self.cache_breakpoints)
         return formatted
 
     def _format_content(self, content: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
@@ -196,7 +222,11 @@ class OpenAICompatibleClient:
         if available <= 0:
             return messages
         # A leading system contract and any compaction summary are context,
-        # not instruction history: keep every leading system message.
+        # not instruction history: keep every leading system message.  The
+        # prompt-cache static block is passed via ``system_prompt`` and its
+        # ``cache_control`` marker is applied at format time (after trimming),
+        # so it survives trimming unchanged; keeping the whole system head here
+        # also preserves the contract and any compaction summary alongside it.
         head = 0
         while head < len(messages) and messages[head].role == "system":
             head += 1

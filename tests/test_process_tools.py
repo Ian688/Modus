@@ -289,3 +289,107 @@ async def test_list_processes_carries_task_fields():
     assert row["task_name"] == "listed-task"
     assert "description" in row
     assert "exit_code" in row
+
+
+# ── T1: process identity / PID-reuse guard (Wave 1) ──
+
+
+def test_spawn_records_born_at():
+    """spawn_process records the child's start time for identity checks."""
+    import modus.tools.process_tools as pt
+
+    result = _run_spawn_sync("sleep 30")
+    pid = result.metadata["process_id"]
+    meta = _read_meta(pid)
+    assert meta.get("born_at") is not None
+    # The recorded born_at is close to the actual start time read back.
+    actual = pt._read_born_at(meta["pid"])
+    assert actual is not None
+    assert abs(actual - meta["born_at"]) < 2.0
+
+
+def test_pid_identity_ok_matching():
+    """A live pid whose start time matches born_at passes identity."""
+    import modus.tools.process_tools as pt
+
+    # Use our own process as a stable, live subject.
+    pid = os.getpid()
+    born = pt._read_born_at(pid)
+    assert born is not None
+    meta = {"pid": pid, "born_at": born}
+    assert pt._pid_identity_ok(meta) is True
+
+
+def test_pid_identity_ok_reused_rejected(monkeypatch):
+    """A pid alive but with a DIFFERENT start time is rejected (PID reuse)."""
+    import modus.tools.process_tools as pt
+
+    pid = os.getpid()
+    born = pt._read_born_at(pid)
+    assert born is not None
+    # Simulate a reused pid: alive, but the registry's born_at is way older.
+    meta = {"pid": pid, "born_at": born - 10_000.0}
+    assert pt._pid_identity_ok(meta) is False
+
+
+def test_process_status_pid_reused(monkeypatch):
+    """A reused pid is reported as pid_reused, never 'running'."""
+    import modus.tools.process_tools as pt
+
+    monkeypatch.setattr(pt, "os", _os_with_kill0_ok())
+    pid = os.getpid()
+    born = pt._read_born_at(pid)
+    meta = {
+        "pid": pid, "born_at": born - 10_000.0, "status": "running",
+        "spawned_by": os.getpid(),
+    }
+    assert pt._process_status(meta) == "pid_reused"
+
+
+@pytest.mark.asyncio
+async def test_kill_refuses_pid_reuse():
+    """kill_process refuses to SIGKILL a pid whose identity changed."""
+    import modus.tools.process_tools as pt
+
+    ctx = _ctx()
+    await spawn_process({"command": "sleep 30"}, ctx)
+    # Grab the most recent registry entry.
+    entries = pt._iter_registry()
+    assert entries, "expected a spawned process"
+    process_id, meta = entries[0]
+    # Corrupt the recorded identity: same pid, wrong start time.
+    meta["born_at"] = meta.get("born_at", time.time()) - 10_000.0
+    _write_meta(process_id, meta)
+    result = await kill_process({"process_id": process_id}, ctx)
+    assert result.is_error
+    assert "refusing" in result.content or "reused" in result.content
+    assert _read_meta(process_id)["status"] == "pid_reused"
+
+
+def _run_spawn_sync(command):
+    """Synchronously run spawn_process via asyncio.run."""
+    import modus.tools.process_tools as pt
+
+    return asyncio.run(pt.spawn_process({"command": command}, _ctx()))
+
+
+def _os_with_kill0_ok():
+    """An os shim where os.kill(pid, 0) succeeds (pid alive)."""
+    import modus.tools.process_tools as pt
+
+    class _Shim:
+        def __init__(self):
+            self.kill = _kill0_ok
+
+    def _kill0_ok(pid, sig):
+        if sig == 0:
+            return None
+        raise ProcessLookupError
+
+    shim = _Shim()
+    # Keep the real attributes process_tools relies on.
+    for attr in ("getpid", "name", "path"):
+        if hasattr(os, attr):
+            setattr(shim, attr, getattr(os, attr))
+    shim.killpg = lambda *a, **k: None
+    return shim

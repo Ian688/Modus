@@ -364,7 +364,20 @@ async def stream_to_ws(
         if session.engine is None:
             raise RuntimeError("Session engine is not configured")
         async def approval_callback(request: dict[str, Any]) -> str:
-            return await wait_for_user_approval_callback(websocket, session, emitter, request)
+            # Fail closed on an unattended approval: bound every approval wait
+            # with the configured timeout so a run can never hang forever on a
+            # human who is not there (the broker arms the same timeout; this
+            # guards paths that bypass the broker's asyncio loop wiring).
+            from modus.config import load_config
+
+            timeout = load_config().runtime.approval_timeout_seconds or 600.0
+            try:
+                return await asyncio.wait_for(
+                    wait_for_user_approval_callback(websocket, session, emitter, request),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                return "deny"
 
         async for event in session.engine.ask(
             message, history=effective_history, approval_callback=approval_callback,

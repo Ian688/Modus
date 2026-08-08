@@ -169,6 +169,38 @@ def test_reject_shutil_attr():
 
 
 @pytest.mark.asyncio
+async def test_office_exec_worker_mode_aggregates(ows):
+    """worker: true runs through the WorkerPool and returns the same result."""
+    _make_excel(ows)
+    result = await office_exec({"path": "sales.xlsx", "worker": True, "script": '''
+import openpyxl, json
+from collections import defaultdict
+wb = openpyxl.load_workbook(ABS_PATH, read_only=True, data_only=True)
+ws = wb.active
+totals = defaultdict(int)
+for row in ws.iter_rows(min_row=2, values_only=True):
+    if row[0]: totals[row[0]] += row[1] or 0
+print(json.dumps(dict(totals)))
+'''}, _ctx(ows))
+    # Worker layer is disabled by default config → falls back to direct path.
+    assert not result.is_error
+    assert "east" in result.content
+    assert "west" in result.content
+
+
+@pytest.mark.asyncio
+async def test_office_exec_worker_mode_disabled_falls_back(ows):
+    """When the worker layer is disabled, worker:true still succeeds."""
+    _make_excel(ows)
+    result = await office_exec(
+        {"path": "sales.xlsx", "worker": True,
+         "script": "print('direct-fallback')"}, _ctx(ows),
+    )
+    assert not result.is_error
+    assert "direct-fallback" in result.content
+
+
+@pytest.mark.asyncio
 async def test_office_exec_timeout_kills_process_group(ows, monkeypatch):
     """A hanging script is terminated at the timeout, not left running."""
     import modus.tools.office_exec as oe

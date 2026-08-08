@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from modus.desktop.approvals import approval_broker
 from modus.desktop.db import create_approval, resolve_approval_record
@@ -22,8 +22,15 @@ async def wait_for_user_approval(
     request: dict[str, Any],
     *,
     timeout: float = 600.0,
+    decision_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
 ) -> str:
-    """Emit one typed request and fail closed on timeout or cancellation."""
+    """Emit one typed request and fail closed on timeout or cancellation.
+
+    ``decision_callback`` (when supplied) receives the final human decision and
+    the original request so the caller can, e.g., write an A2 denial reason or
+    an A1 remember rule into the session grant store.  It is best-effort: a
+    failure here never changes the resolved approval.
+    """
     approval_id = uuid.uuid4().hex
     approval_key = (emitter.run_id, approval_id)
     controller = session.active_controller
@@ -71,9 +78,10 @@ async def wait_for_user_approval(
                     (controller is not None and controller.cancel_event.is_set())
                     or (session._cancel is not None and session._cancel.is_set())
                 )
+                decision_value = _decision_string(decision)
                 normalized = (
                     "allow"
-                    if str(decision).lower() in {"approve", "allow"} and not cancelled
+                    if decision_value in {"approve", "allow"} and not cancelled
                     else "deny"
                 )
                 resolve_approval_record(
@@ -96,6 +104,22 @@ async def wait_for_user_approval(
                     status=EventStatus.CANCELLED if normalized == "deny" else EventStatus.COMPLETED,
                     parent_event_id=approval_event.event_id,
                 )
+                if not cancelled and decision_callback is not None:
+                    try:
+                        await decision_callback(normalized, request)
+                    except Exception:
+                        logger.exception(
+                            "approval decision callback failed run=%s id=%s",
+                            emitter.run_id,
+                            approval_id,
+                        )
+                # A structured ApprovalResponse carries a deny reason or a
+                # remember intent back to the executor; a plain string keeps
+                # the legacy "allow"/"deny" contract.
+                from modus.tools.base import ApprovalResponse
+
+                if isinstance(decision, ApprovalResponse) and not cancelled:
+                    return decision
                 return normalized
             except asyncio.CancelledError:
                 if session._cancel is not None and session._cancel.is_set():
@@ -149,15 +173,63 @@ async def wait_for_user_approval(
 
 
 def resolve_pending_approval(
-    session: Any, run_id: str, approval_id: str, decision: str,
+    session: Any, run_id: str, approval_id: str, decision: str | dict,
 ) -> bool:
-    """Resolve exactly one run-bound approval, including after reconnect."""
+    """Resolve exactly one run-bound approval, including after reconnect.
+
+    ``decision`` may be a plain string (``approve``/``allow``/``deny``/``skip``)
+    or a structured payload from the desktop card:
+        {"decision": "deny", "reason": "..."}      → A2 deny re-injection
+        {"decision": "approve", "remember": true}  → A1 per-resource grant
+        {"decision": "approve", "remember_pattern": "cat *"}  → A2 rule memory
+    The reason rides along so the deny result can carry it back to the model;
+    the executor reads remember intent from the callback response.  A plain
+    string keeps the legacy ``"approve"``/``"deny"`` contract.
+    """
     if not run_id or not approval_id:
         return False
-    if approval_broker.resolve(run_id, approval_id, decision):
+    remember = False
+    remember_pattern = None
+    if isinstance(decision, dict):
+        reason = str(decision.get("reason") or "")
+        remember = bool(decision.get("remember") or False)
+        remember_pattern = str(decision.get("remember_pattern") or "") or None
+        decision = str(decision.get("decision") or "deny")
+    else:
+        reason = ""
+    value: Any = decision
+    if str(decision).lower() in {"approve", "allow"} and (remember or remember_pattern):
+        try:
+            from modus.tools.base import ApprovalResponse
+
+            value = ApprovalResponse.approve(
+                remember=remember, remember_pattern=remember_pattern,
+            )
+        except Exception:
+            value = decision
+    elif reason and str(decision).lower() in {"deny", "denied"}:
+        try:
+            from modus.tools.base import ApprovalResponse
+
+            value = ApprovalResponse.deny(reason)
+        except Exception:
+            value = decision
+    if approval_broker.resolve(run_id, approval_id, value):
         return True
     future = session.pending_approvals.get((run_id, approval_id))
     if future is None or future.done():
         return False
-    future.set_result(decision)
+    future.set_result(value)
     return True
+
+
+def _decision_string(decision: Any) -> str:
+    """Normalize a resolved approval value to a plain decision string."""
+    if hasattr(decision, "decision"):
+        try:
+            return str(decision.decision).lower()
+        except Exception:
+            return "deny"
+    if isinstance(decision, str):
+        return decision.strip().lower()
+    return str(decision or "").lower()
